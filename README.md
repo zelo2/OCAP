@@ -106,11 +106,6 @@ data/processed/globem_full.csv
 
 ## Running OCAP
 
-The runner standardizes each feature using statistics from earlier triplets,
-then updates those statistics. Each triplet is evaluated in predict-then-update order. The runner saves eight metrics per seed in `<dataset>_main_seed<seed>/metrics.json` and prints their means across the requested seeds.
-Table 2 uses F1, Accuracy, Recall, and ROC AUC over the full stream. AUC uses the positive-class probability used for prediction.
-Table 3 uses F1@5, F1@10, R@5, and R@10. At each cutoff, scores are computed on each eligible user's first records and averaged equally across users with at least that many records.
-
 ```bash
 python process/run_ocap.py \
   --dataset ces \
