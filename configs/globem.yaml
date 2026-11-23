@@ -51,4 +51,3 @@ refinements:
   reassignment_min_buffer: 5
   reassignment_loss_margin: 0.01
   reassignment_every: 10
-evaluation: {first_k: [5, 10], require_complete_first_k: true}

@@ -13,7 +13,7 @@ import torch
 from .config import ExperimentConfig
 from .data import DataTriplet
 from .grouping import agglomerative_groups, cosine, match_clusters, normalize
-from .metrics import binary_metrics, first_k_metrics
+from .metrics import Prediction, paper_metrics
 from .model import OCAPModel, weighted_focal_loss
 
 
@@ -52,9 +52,7 @@ class OCAP:
         self.group_set: Dict[str, Set[str]] = {}
         self.next_group_index = 0
         self.group_update_count = 0
-        self.prediction_history: List[Dict[str, object]] = []
-        self.group_trace: List[Dict[str, object]] = []
-        self._last_reassignment_diagnostics: Dict[str, int] = {}
+        self.prediction_history: List[Prediction] = []
         self.group_gradient_buffer: Dict[str, List[np.ndarray]] = defaultdict(list)
         self.smooth_probabilities: Dict[str, Deque[float]] = defaultdict(
             lambda: deque(maxlen=max(1, self.cfg.training.smoothing_window))
@@ -66,7 +64,6 @@ class OCAP:
         self.threshold_updates = 0
         self.mix_weights: Dict[str, Dict[str, float]] = {}
         self.group_initialized_personal_adapters: Set[str] = set()
-        self.personal_adapter_update_count: MutableMapping[str, int] = defaultdict(int)
         self._ensure_adapter("global")
 
     def _ensure_adapter(self, key: str, *, reset_optimizer: bool = False) -> None:
@@ -181,7 +178,7 @@ class OCAP:
 
     def _prediction_logits(
         self, triplet: DataTriplet,
-    ) -> tuple[torch.Tensor, str, Dict[str, torch.Tensor], Dict[str, float]]:
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, float]]:
         uid = triplet.user_id
         active = self._routed_adapter_key(uid)
         grouping = self.cfg.grouping
@@ -192,15 +189,11 @@ class OCAP:
         if can_mix:
             experts = self._expert_logits(triplet.features, uid)
             mixed, weights = self._mix_logits(uid, experts)
-            return self._apply_bias(mixed, uid, warmup=False), "safe_mix", experts, weights
+            return self._apply_bias(mixed, uid, warmup=False), experts, weights
         logits = self.model(self._tensor(triplet.features), active)
         return self._apply_bias(
             logits, uid, warmup=triplet.index < grouping.backbone_warmup_steps,
-        ), active, {}, {}
-
-    @staticmethod
-    def _positive_probability(logits: torch.Tensor) -> float:
-        return float(torch.sigmoid(logits[:, 1] - logits[:, 0])[0].item())
+        ), {}, {}
 
     @staticmethod
     def _f1_at_threshold(probabilities: np.ndarray, labels: np.ndarray, threshold: float) -> float:
@@ -240,15 +233,15 @@ class OCAP:
         adjusted = base - train.user_threshold_posrate_bias_alpha * (user_rate - group_rate)
         return float(np.clip(adjusted, 0.05, 0.95))
 
-    def _predict(self, triplet: DataTriplet) -> tuple[float, float, str, Dict[str, torch.Tensor], Dict[str, float]]:
+    def _predict(self, triplet: DataTriplet) -> tuple[float, float, Dict[str, torch.Tensor], Dict[str, float]]:
         self.model.eval()
         with torch.no_grad():
-            logits, adapter_source, experts, weights = self._prediction_logits(triplet)
-            raw_probability = self._positive_probability(logits)
+            logits, experts, weights = self._prediction_logits(triplet)
+            raw_probability = float(torch.sigmoid(logits[:, 1] - logits[:, 0])[0].item())
         history = self.smooth_probabilities[triplet.user_id]
         history.append(raw_probability)
         probability = float(np.mean(history))
-        return probability, raw_probability, adapter_source, experts, weights
+        return probability, raw_probability, experts, weights
 
     def _update_mix_weights(
         self, uid: str, experts: Mapping[str, torch.Tensor], weights: Mapping[str, float], label: int,
@@ -300,8 +293,6 @@ class OCAP:
         if is_warmup:
             self.backbone_optimizer.step()
         optimizer.step()
-        if adapter_key == self._personal_adapter_key(uid):
-            self.personal_adapter_update_count[uid] += 1
         if not is_warmup and gradient_direction is not None and uid in self.group_assignment:
             self.group_gradient_buffer[self.group_assignment[uid]].append(gradient_direction)
         self.backbone_optimizer.zero_grad(set_to_none=True)
@@ -314,11 +305,11 @@ class OCAP:
             updated -= ref.per_user_bias_lr * gradient
             self.user_bias[uid] = float(np.clip(updated, -ref.per_user_bias_clip, ref.per_user_bias_clip))
 
-    def _apply_group_gradient_update(self) -> int:
+    def _apply_group_gradient_update(self) -> None:
         group_means = [np.mean(np.stack(rows), axis=0) for rows in self.group_gradient_buffer.values() if rows]
         self.group_gradient_buffer.clear()
         if not group_means:
-            return 0
+            return
         update = np.mean(np.stack(group_means), axis=0)
         norm = float(np.linalg.norm(update))
         clip = self.cfg.training.gradient_direction_clip_norm
@@ -333,7 +324,6 @@ class OCAP:
             self.model.backbone.gradient_projection.add_(
                 tensor, alpha=-self.cfg.training.backbone_lr * self.cfg.training.backbone_lr_scale
             )
-        return len(group_means)
 
     def _users_ready_for_grouping(self, initial: bool = False) -> List[str]:
         grouping = self.cfg.grouping
@@ -400,28 +390,11 @@ class OCAP:
         users_for_grouping: Sequence[str],
         personal_adapter_sources: Mapping[str, str],
         step: int,
-    ) -> tuple[List[Set[str]], int]:
+    ) -> List[Set[str]]:
         ref = self.cfg.refinements
         result = [set(cluster) for cluster in clusters]
-        diagnostics = {
-            "skipped_cadence": 0,
-            "skipped_group_count": 0,
-            "users_for_grouping": len(users_for_grouping),
-            "skipped_observations": 0,
-            "skipped_buffer": 0,
-            "skipped_unassigned": 0,
-            "skipped_singleton": 0,
-            "evaluated_users": 0,
-            "moves": 0,
-        }
-        if self.group_update_count % max(1, ref.reassignment_every) != 0:
-            diagnostics["skipped_cadence"] = 1
-            self._last_reassignment_diagnostics = diagnostics
-            return result, 0
-        if len(result) < 2:
-            diagnostics["skipped_group_count"] = 1
-            self._last_reassignment_diagnostics = diagnostics
-            return result, 0
+        if len(result) < 2 or self.group_update_count % max(1, ref.reassignment_every) != 0:
+            return result
         candidate_group_adapter_keys: Dict[int, str] = {}
         for index, cluster in enumerate(result):
             key = f"diagnostic::reassignment::{step}::{index}"
@@ -430,22 +403,16 @@ class OCAP:
         cluster_by_user = {
             uid: index for index, cluster in enumerate(result) for uid in cluster
         }
-        moves = 0
         for uid in sorted(users_for_grouping):
             if self.user_record_counts[uid] < ref.reassignment_min_observations:
-                diagnostics["skipped_observations"] += 1
                 continue
             if len(self.recent_data_buffers[uid]) < ref.reassignment_min_buffer:
-                diagnostics["skipped_buffer"] += 1
                 continue
             if uid not in cluster_by_user:
-                diagnostics["skipped_unassigned"] += 1
                 continue
             current = cluster_by_user[uid]
             if len(result[current]) <= 1:
-                diagnostics["skipped_singleton"] += 1
                 continue
-            diagnostics["evaluated_users"] += 1
             losses = {
                 index: self._recent_loss(uid, key)
                 for index, key in candidate_group_adapter_keys.items()
@@ -460,10 +427,7 @@ class OCAP:
                 result[current].discard(uid)
                 result[best].add(uid)
                 cluster_by_user[uid] = best
-                moves += 1
-        diagnostics["moves"] = moves
-        self._last_reassignment_diagnostics = diagnostics
-        return [cluster for cluster in result if cluster], moves
+        return [cluster for cluster in result if cluster]
 
     def _initialize_group_adapter(
         self, gid: str, members: Set[str], personal_adapter_sources: Mapping[str, str], created: bool,
@@ -507,12 +471,11 @@ class OCAP:
             target = max(grouping.warmup_initial_min_groups, min(grouping.warmup_initial_max_groups, target))
             if grouping.warmup_initial_force_accept:
                 min_cosine = -1.0
-        result = agglomerative_groups(users_for_grouping, projected_user_representations, target, min_cosine)
-        clusters, reassignment_moves = self._apply_dynamic_user_reassignment(
-            result.clusters, users_for_grouping, sources, step,
+        clusters = agglomerative_groups(users_for_grouping, projected_user_representations, target, min_cosine)
+        clusters = self._apply_dynamic_user_reassignment(
+            clusters, users_for_grouping, sources, step,
         )
         previous = self.group_set
-        old_assignment = self.group_assignment
         new_groups, self.next_group_index, created = match_clusters(previous, clusters, self.next_group_index)
         for gid, members in new_groups.items():
             self._initialize_group_adapter(gid, members, sources, gid in created)
@@ -521,58 +484,19 @@ class OCAP:
         for uid, gid in self.group_assignment.items():
             self._initialize_personal_adapter_from_group(uid, gid)
         self.group_update_count += 1
-        common = set(old_assignment) & set(self.group_assignment)
-        churn = float(np.mean([old_assignment[u] != self.group_assignment[u] for u in common])) if common else 0.0
-        self.group_trace.append({
-            "step": step,
-            "initial": initial,
-            "users_for_grouping": len(users_for_grouping),
-            "n_groups": len(self.group_set),
-            "n_merges": result.merges,
-            "n_reassignment_moves": reassignment_moves,
-            "churn": churn,
-            "stop_reason": "warmup_forced_target" if initial else result.stop_reason,
-            "last_similarity": result.last_similarity,
-            **{
-                f"reassignment_{key}": value
-                for key, value in self._last_reassignment_diagnostics.items()
-            },
-        })
 
     def _boundary(self, step: int, initial: bool) -> None:
-        gradient_groups = self._apply_group_gradient_update()
+        self._apply_group_gradient_update()
         self._update_groups(step, initial=initial)
-        if self.group_trace and self.group_trace[-1]["step"] == step:
-            self.group_trace[-1]["gradient_update_groups"] = gradient_groups
         if initial:
             self.interval_gradient_history.clear()
 
-    def process(self, triplet: DataTriplet) -> Dict[str, object]:
+    def process(self, triplet: DataTriplet) -> Prediction:
         uid = triplet.user_id
         self._personal_adapter_key(uid)
-        probability, raw_probability, adapter_source, experts, weights = self._predict(triplet)
+        probability, raw_probability, experts, weights = self._predict(triplet)
         threshold = self._biased_threshold(uid, self._current_threshold())
-        is_warmup = triplet.index < self.cfg.grouping.backbone_warmup_steps
-        row: Dict[str, object] = {
-            "time_index": triplet.index,
-            "timestamp": triplet.timestamp,
-            "user_id": uid,
-            "user_record_index": self.user_record_counts[uid] + 1,
-            "label": triplet.label,
-            "prediction": int(probability >= threshold),
-            "probability": probability,
-            "raw_probability": raw_probability,
-            "threshold": threshold,
-            "routed_adapter": adapter_source,
-            "group_id": self.group_assignment.get(uid, ""),
-            "learning_phase": "backbone_warmup" if is_warmup else "adapter_learning",
-            "adapter_routing_state": (
-                "backbone_warmup"
-                if is_warmup
-                else ("group" if uid in self.group_assignment else "personal")
-            ),
-            "during_backbone_warmup": is_warmup,
-        }
+        row = Prediction(uid, triplet.label, int(probability >= threshold), probability)
         self.prediction_history.append(row)
         self._update_mix_weights(uid, experts, weights, triplet.label)
         self._learn_from_triplet(triplet, raw_probability)
@@ -591,33 +515,7 @@ class OCAP:
             self._boundary(step, initial=False)
         return row
 
-    def summarize(self) -> Dict[str, object]:
-        y = [int(row["label"]) for row in self.prediction_history]
-        predictions = [int(row["prediction"]) for row in self.prediction_history]
-        post_rows = [
-            row for row in self.prediction_history
-            if not bool(row["during_backbone_warmup"])
-        ]
-        post_y = [int(row["label"]) for row in post_rows]
-        post_predictions = [int(row["prediction"]) for row in post_rows]
-        low_evidence = first_k_metrics(
-            self.prediction_history, self.cfg.evaluation.first_k, self.cfg.evaluation.require_complete_first_k
-        )
-        return {
-            "overall": binary_metrics(y, predictions),
-            "post_warmup": binary_metrics(post_y, post_predictions),
-            "low_evidence": low_evidence,
-            "mean_first_k_f1": float(np.mean([row["f1_at_k"] for row in low_evidence])) if low_evidence else float("nan"),
-            "n_groups_final": len(self.group_set),
-            "mean_groups": float(np.mean([row["n_groups"] for row in self.group_trace])) if self.group_trace else 0.0,
-            "n_data_triplets": len(self.prediction_history),
-            "n_users": len(self.user_record_counts),
-            "configuration": "main",
-            "group_adapter_construction": "merged_trainable",
-            "personal_adapter_updates": int(sum(self.personal_adapter_update_count.values())),
-        }
-
-    def run(self, stream: Sequence[DataTriplet]) -> Dict[str, object]:
+    def run(self, stream: Sequence[DataTriplet]) -> dict[str, float | None]:
         for triplet in stream:
             self.process(triplet)
-        return self.summarize()
+        return paper_metrics(self.prediction_history)

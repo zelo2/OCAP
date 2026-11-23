@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import yaml
 
@@ -77,12 +77,6 @@ class RefinementConfig:
 
 
 @dataclass
-class EvaluationConfig:
-    first_k: List[int] = field(default_factory=lambda: [5, 10, 20, 50])
-    require_complete_first_k: bool = True
-
-
-@dataclass
 class ExperimentConfig:
     dataset: str = "custom"
     seed: int = 42
@@ -91,10 +85,6 @@ class ExperimentConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     refinements: RefinementConfig = field(default_factory=RefinementConfig)
-    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
 
 
 def _construct(data: Dict[str, Any]) -> ExperimentConfig:
@@ -106,7 +96,6 @@ def _construct(data: Dict[str, Any]) -> ExperimentConfig:
         training=TrainingConfig(**data.get("training", {})),
         grouping=GroupingConfig(**data.get("grouping", {})),
         refinements=RefinementConfig(**data.get("refinements", {})),
-        evaluation=EvaluationConfig(**data.get("evaluation", {})),
     )
 
 

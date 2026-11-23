@@ -1,18 +1,9 @@
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass
 from typing import Dict, List, Mapping, Sequence, Set, Tuple
 
 import numpy as np
-
-
-@dataclass
-class AgglomerationResult:
-    clusters: List[Set[str]]
-    merges: int
-    stop_reason: str
-    last_similarity: float
 
 
 def normalize(vector: np.ndarray) -> np.ndarray:
@@ -36,10 +27,10 @@ def agglomerative_groups(
     representations: Mapping[str, np.ndarray],
     minimum_group_count: int,
     min_pair_cosine: float = 0.0,
-) -> AgglomerationResult:
+) -> List[Set[str]]:
     ordered = [user for user in sorted(users) if user in representations]
     if not ordered:
-        return AgglomerationResult([], 0, "no_representations", float("nan"))
+        return []
     clusters: Dict[int, Set[str]] = {
         index: {user} for index, user in enumerate(ordered)
     }
@@ -69,8 +60,6 @@ def agglomerative_groups(
             )
             heapq.heappush(heap, (-score, sequence, left, right))
             sequence += 1
-    merges = 0
-    last_similarity = float("nan")
     next_cluster_id = len(ordered)
     target = max(1, int(minimum_group_count))
     while len(clusters) > target:
@@ -79,16 +68,10 @@ def agglomerative_groups(
             if left in clusters and right in clusters:
                 break
         else:
-            return AgglomerationResult(
-                list(clusters.values()), merges, "no_pair", last_similarity,
-            )
+            return list(clusters.values())
         score = -neg_score
-        last_similarity = score
         if score < min_pair_cosine:
-            return AgglomerationResult(
-                sorted(clusters.values(), key=lambda group: tuple(sorted(group))),
-                merges, "negative_best_gain", score,
-            )
+            break
         left_size = sizes[left]
         right_size = sizes[right]
         merged_size = left_size + right_size
@@ -127,11 +110,7 @@ def agglomerative_groups(
             left_id, right_id = sorted((other, merged_id))
             heapq.heappush(heap, (-score, sequence, left_id, right_id))
             sequence += 1
-        merges += 1
-    return AgglomerationResult(
-        sorted(clusters.values(), key=lambda group: tuple(sorted(group))),
-        merges, "minimum_group_count", last_similarity,
-    )
+    return sorted(clusters.values(), key=lambda group: tuple(sorted(group)))
 
 
 def match_clusters(

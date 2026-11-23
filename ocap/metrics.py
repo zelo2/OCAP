@@ -1,79 +1,47 @@
-from __future__ import annotations
-
 from collections import defaultdict
-from typing import Dict, Iterable, List, Mapping, Sequence
+from dataclasses import dataclass
+from statistics import mean
+from typing import Sequence
 
-import numpy as np
+from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
 
 
-def binary_metrics(y_true: Sequence[int], y_pred: Sequence[int]) -> Dict[str, float]:
-    y = np.asarray(y_true, dtype=np.int64)
-    p = np.asarray(y_pred, dtype=np.int64)
-    if y.size == 0:
-        return {key: float("nan") for key in (
-            "accuracy", "precision", "recall", "specificity", "balanced_accuracy", "f1"
-        )}
-    tp = int(np.sum((y == 1) & (p == 1)))
-    tn = int(np.sum((y == 0) & (p == 0)))
-    fp = int(np.sum((y == 0) & (p == 1)))
-    fn = int(np.sum((y == 1) & (p == 0)))
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
-    specificity = tn / (tn + fp) if tn + fp else 0.0
-    f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {
-        "accuracy": (tp + tn) / y.size,
-        "precision": precision,
-        "recall": recall,
-        "specificity": specificity,
-        "balanced_accuracy": 0.5 * (recall + specificity),
-        "f1": f1,
-        "tp": float(tp),
-        "tn": float(tn),
-        "fp": float(fp),
-        "fn": float(fn),
-        "n": float(y.size),
+@dataclass(frozen=True)
+class Prediction:
+    user_id: str
+    label: int
+    predicted: int
+    probability: float
+
+
+def paper_metrics(history: Sequence[Prediction]) -> dict[str, float | None]:
+    """Score the full stream and each eligible user's first 5 and 10 predictions."""
+    labels = [row.label for row in history]
+    predicted = [row.predicted for row in history]
+    scores = [row.probability for row in history]
+    metrics = {
+        "F1": float(f1_score(labels, predicted, zero_division=0)) if labels else None,
+        "Accuracy": float(accuracy_score(labels, predicted)) if labels else None,
+        "Recall": float(recall_score(labels, predicted, zero_division=0)) if labels else None,
+        "AUC": float(roc_auc_score(labels, scores)) if len(set(labels)) == 2 else None,
     }
 
+    first_ten = defaultdict(list)
+    for row in history:
+        if len(first_ten[row.user_id]) < 10:
+            first_ten[row.user_id].append(row)
 
-def first_k_metrics(
-    data_triplets: Iterable[Mapping[str, object]], ks: Sequence[int], require_complete: bool = True,
-) -> List[Dict[str, float]]:
-    by_user: Dict[str, List[Mapping[str, object]]] = defaultdict(list)
-    for triplet in data_triplets:
-        by_user[str(triplet["user_id"])].append(triplet)
-    rows: List[Dict[str, float]] = []
-    for k in sorted(set(int(v) for v in ks)):
-        pooled_y: List[int] = []
-        pooled_p: List[int] = []
-        macro: Dict[str, List[float]] = defaultdict(list)
-        included_users = 0
-        for user_history in by_user.values():
-            if require_complete and len(user_history) < k:
+    for k in (5, 10):
+        f1_values = []
+        recall_values = []
+        for rows in first_ten.values():
+            if len(rows) < k:
                 continue
-            subset = user_history[:k]
-            if not subset:
-                continue
-            included_users += 1
-            y = [int(row["label"]) for row in subset]
-            p = [int(row["prediction"]) for row in subset]
-            pooled_y.extend(y)
-            pooled_p.extend(p)
-            values = binary_metrics(y, p)
-            for key in ("f1", "recall", "specificity", "balanced_accuracy"):
-                macro[key].append(values[key])
-        pooled = binary_metrics(pooled_y, pooled_p)
-        rows.append({
-            "k": float(k),
-            "n_users": float(included_users),
-            "n_data_triplets": float(len(pooled_y)),
-            "f1_at_k": float(np.mean(macro["f1"])) if macro["f1"] else float("nan"),
-            "recall_at_k": float(np.mean(macro["recall"])) if macro["recall"] else float("nan"),
-            "specificity_at_k": float(np.mean(macro["specificity"])) if macro["specificity"] else float("nan"),
-            "balanced_accuracy_at_k": float(np.mean(macro["balanced_accuracy"])) if macro["balanced_accuracy"] else float("nan"),
-            "pooled_f1": pooled["f1"],
-            "pooled_recall": pooled["recall"],
-            "pooled_specificity": pooled["specificity"],
-            "pooled_balanced_accuracy": pooled["balanced_accuracy"],
-        })
-    return rows
+            prefix = rows[:k]
+            y = [row.label for row in prefix]
+            p = [row.predicted for row in prefix]
+            f1_values.append(float(f1_score(y, p, zero_division=0)))
+            recall_values.append(float(recall_score(y, p, zero_division=0)))
+        metrics[f"F1@{k}"] = mean(f1_values) if f1_values else None
+        metrics[f"R@{k}"] = mean(recall_values) if recall_values else None
+    return metrics
