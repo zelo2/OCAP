@@ -112,8 +112,9 @@ def build(source_root: Path, output_csv: Path, strict_release: bool = True) -> d
     feature_columns = DIRECT_FEATURES + DERIVED_FEATURES
     selected = selected[feature_columns].fillna(0.0)
     user_key = frame["uid"].astype(str)
-    means = selected.groupby(user_key, sort=False).transform("mean")
-    stds = selected.groupby(user_key, sort=False).transform(
+    by_user = selected.groupby(user_key, sort=False)
+    means = by_user.transform("mean")
+    stds = by_user.transform(
         lambda values: values.std(ddof=0)
     ).replace(0.0, 1.0)
     selected = (selected - means) / stds

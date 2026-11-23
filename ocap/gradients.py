@@ -14,21 +14,17 @@ def update_user_history(
     uid: str, grad: torch.Tensor | None, decay: float,
     histories: dict[str, np.ndarray], interval_histories: dict[str, np.ndarray],
 ) -> np.ndarray | None:
-    gradient_direction = None
-    if grad is not None:
-        gradient_direction = grad.detach().cpu().numpy().reshape(-1).astype(np.float64, copy=True)
-        if np.all(np.isfinite(gradient_direction)) and np.linalg.norm(gradient_direction) > 1e-12:
-            old = histories.get(uid)
-            updated = gradient_direction if old is None else decay * old + (1.0 - decay) * gradient_direction
-            histories[uid] = updated.copy()
-            if uid not in interval_histories:
-                interval_histories[uid] = gradient_direction.copy()
+    if grad is None:
+        return None
+    direction = grad.detach().cpu().numpy().reshape(-1).astype(np.float64, copy=True)
+    if np.all(np.isfinite(direction)) and np.linalg.norm(direction) > 1e-12:
+        for history in (histories, interval_histories):
+            previous = history.get(uid)
+            if previous is None:
+                history[uid] = direction.copy()
             else:
-                interval_histories[uid] = (
-                    decay * interval_histories[uid]
-                    + (1.0 - decay) * gradient_direction
-                )
-    return gradient_direction
+                history[uid] = decay * previous + (1.0 - decay) * direction
+    return direction
 
 
 def project_user_representations(

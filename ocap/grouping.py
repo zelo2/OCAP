@@ -29,14 +29,12 @@ def eligible_users(
     *, initial: bool,
 ) -> List[str]:
     minimum = grouping.warmup_initial_min_samples if initial else grouping.min_observations
-    users = [
-        uid for uid in sorted(histories)
-        if counts[uid] >= minimum
-    ]
+    ordered = sorted(histories)
+    users = [uid for uid in ordered if counts[uid] >= minimum]
     if not initial or len(users) >= grouping.warmup_min_grouping_users:
         return users
     fallback = [
-        uid for uid in sorted(histories)
+        uid for uid in ordered
         if counts[uid] >= grouping.warmup_initial_min_samples_fallback
     ]
     return (
@@ -129,6 +127,8 @@ def agglomerative_groups(
         clusters[merged_id] = merged_members
         centroids[merged_id] = merged_centroid
         sizes[merged_id] = merged_size
+        if len(clusters) == target:
+            break
         other_ids = sorted(cluster_id for cluster_id in clusters if cluster_id != merged_id)
         other_matrix = np.stack([centroids[other] for other in other_ids])
         other_norms = np.linalg.norm(other_matrix, axis=1)

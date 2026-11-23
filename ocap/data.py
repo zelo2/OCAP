@@ -68,7 +68,7 @@ def prepare_stream(
     label_column: str,
     positive_values: Sequence[str] = ("1", "true", "positive", "yes"),
 ) -> pd.DataFrame:
-    frame = _read_table(Path(input_path)).copy()
+    frame = _read_table(Path(input_path))
     missing = [name for name in (user_column, time_column, label_column) if name not in frame.columns]
     if missing:
         raise ValueError(f"Missing required source columns: {missing}")
@@ -80,7 +80,7 @@ def prepare_stream(
         positive = {value.lower() for value in positive_values}
         frame["label"] = labels.astype(str).str.lower().isin(positive).astype(int)
     else:
-        unique = sorted(pd.Series(labels).dropna().unique().tolist())
+        unique = sorted(labels.dropna().unique().tolist())
         if len(unique) != 2:
             raise ValueError(f"Expected a binary label, got values {unique}")
         frame["label"] = (labels == unique[-1]).astype(int)
@@ -116,15 +116,16 @@ def load_stream(path: str | Path) -> tuple[List[DataTriplet], List[str]]:
         raise ValueError("No feature columns were found")
     matrix = frame[feature_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
     scaler = OnlineStandardizer(matrix.shape[1])
-    matrix = np.stack([scaler.transform_then_update(row) for row in matrix])
+    if not len(matrix):
+        raise ValueError("Cannot load an empty stream")
     data_triplets = [
         DataTriplet(
             index=i,
             user_id=str(frame.at[i, "user_id"]),
             label=int(frame.at[i, "label"]),
-            features=matrix[i],
+            features=scaler.transform_then_update(row),
         )
-        for i in range(len(frame))
+        for i, row in enumerate(matrix)
     ]
     return data_triplets, feature_columns
 

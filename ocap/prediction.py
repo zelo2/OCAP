@@ -20,13 +20,14 @@ def expert_weights(
     for key in experts:
         if key.startswith("group::"):
             priors[key] = grouping.low_evidence_prior_group
-    weights = {key: float(previous.get(key, priors.get(key, 0.0))) for key in experts}
-    total = sum(max(0.0, value) for value in weights.values())
+    weights = {}
+    for key in experts:
+        value = float(previous.get(key, priors.get(key, 0.0)))
+        weights[key] = max(0.0, value)
+    total = sum(weights.values())
     if total <= 0.0:
-        weights = {key: 1.0 / len(experts) for key in experts}
-    else:
-        weights = {key: max(0.0, value) / total for key, value in weights.items()}
-    return weights
+        return {key: 1.0 / len(experts) for key in experts}
+    return {key: value / total for key, value in weights.items()}
 
 
 def _f1_at_threshold(probabilities: np.ndarray, labels: np.ndarray, threshold: float) -> float:

@@ -257,11 +257,11 @@ class OCAP:
         result = [set(cluster) for cluster in clusters]
         if len(result) < 2 or self.group_update_count % max(1, ref.reassignment_every) != 0:
             return result
-        candidate_group_adapter_keys: Dict[int, str] = {}
+        candidate_adapters: List[str] = []
         for index, cluster in enumerate(result):
             key = f"diagnostic::reassignment::{step}::{index}"
             self.model.set_adapter_mean(key, [personal_adapter_sources[uid] for uid in sorted(cluster)])
-            candidate_group_adapter_keys[index] = key
+            candidate_adapters.append(key)
         cluster_by_user = {
             uid: index for index, cluster in enumerate(result) for uid in cluster
         }
@@ -277,7 +277,7 @@ class OCAP:
                 continue
             losses = {
                 index: self._recent_loss(uid, key)
-                for index, key in candidate_group_adapter_keys.items()
+                for index, key in enumerate(candidate_adapters)
             }
             best = min(losses, key=losses.get)
             if (
@@ -289,7 +289,7 @@ class OCAP:
                 result[current].discard(uid)
                 result[best].add(uid)
                 cluster_by_user[uid] = best
-        for key in candidate_group_adapter_keys.values():
+        for key in candidate_adapters:
             self.model.remove_adapter(key)
         return [cluster for cluster in result if cluster]
 

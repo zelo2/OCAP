@@ -150,7 +150,7 @@ def _load_feature_table(
         "dropped_mixed_type_columns": int(len(dropped_mixed)),
         "dropped_high_missing_columns": int(len(dropped_high_missing)),
         "remaining_feature_columns": int(len(feature_cols)),
-        "mean_missing_ratio_after_filter": float(df[feature_cols].isna().mean().mean()) if feature_cols else 0.0,
+        "mean_missing_ratio_after_filter": float(na_ratio[feature_cols].mean()) if feature_cols else 0.0,
     }
     return df, summary, manifest
 
@@ -164,8 +164,8 @@ def _prepare_one_cohort(
     weekly = _load_weekly_labels(cohort_dir)
     platform = _load_platform(cohort_dir)
 
-    base = weekly.copy()
-    keys = weekly[["pid", "date"]].copy()
+    base = weekly
+    keys = weekly[["pid", "date"]]
     manifests: List[pd.DataFrame] = []
     feature_summaries: Dict[str, object] = {}
 
@@ -177,8 +177,7 @@ def _prepare_one_cohort(
             max_missing_ratio=max_missing_ratio,
             drop_discrete_rank=drop_discrete_rank,
         )
-        feat_cols = [c for c in feat_df.columns if c not in {"pid", "date"}]
-        base = base.merge(feat_df[["pid", "date"] + feat_cols], on=["pid", "date"], how="left")
+        base = base.merge(feat_df, on=["pid", "date"], how="left")
         feature_summaries[modality] = feat_summary
         manifests.append(manifest)
 
