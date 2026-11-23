@@ -5,23 +5,14 @@ import math
 import random
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Set
+from typing import Deque, Dict, List, Mapping, MutableMapping, Sequence, Set
 
 import numpy as np
 import torch
-from torch.nn import functional as F
 
 from .config import ExperimentConfig
 from .data import DataTriplet
-from .grouping import (
-    agglomerative_groups,
-    binary_split,
-    cosine,
-    incremental_split_merge_groups,
-    match_clusters,
-    normalize,
-    random_groups,
-)
+from .grouping import agglomerative_groups, cosine, match_clusters, normalize
 from .metrics import binary_metrics, first_k_metrics
 from .model import OCAPModel, weighted_focal_loss
 
@@ -39,16 +30,8 @@ class OCAP:
         self,
         input_dim: int,
         config: ExperimentConfig,
-        method: str = "ocap",
-        grouping_signal: str = "gradient",
-        group_adapter_construction: str = "merged_trainable",
     ) -> None:
         self.cfg = copy.deepcopy(config)
-        self.method = method
-        self.grouping_signal = grouping_signal
-        if group_adapter_construction not in {"merged_trainable", "personal_adapter_mean", "shadow_personal_adapter"}:
-            raise ValueError(f"unknown group_adapter_construction: {group_adapter_construction}")
-        self.group_adapter_construction = group_adapter_construction
         self.device = torch.device(self.cfg.device)
         random.seed(self.cfg.seed)
         np.random.seed(self.cfg.seed)
@@ -63,20 +46,14 @@ class OCAP:
         self.positive_record_counts: MutableMapping[str, int] = defaultdict(int)
         self.user_bias: Dict[str, float] = {}
         self.gradient_history: Dict[str, np.ndarray] = {}
-        self.gradient_history_count: MutableMapping[str, int] = defaultdict(int)
         self.interval_gradient_history: Dict[str, np.ndarray] = {}
-        self.interval_gradient_count: MutableMapping[str, int] = defaultdict(int)
-        self.feature_representation: Dict[str, np.ndarray] = {}
         self.recent_data_buffers: Dict[str, Deque[RecentDataPair]] = defaultdict(lambda: deque(maxlen=64))
-        self.group_update_buffer: Dict[str, List[RecentDataPair]] = defaultdict(list)
-        self.previous_group_update_buffer: Dict[str, List[RecentDataPair]] = defaultdict(list)
         self.group_assignment: Dict[str, str] = {}
         self.group_set: Dict[str, Set[str]] = {}
         self.next_group_index = 0
         self.group_update_count = 0
         self.prediction_history: List[Dict[str, object]] = []
         self.group_trace: List[Dict[str, object]] = []
-        self._last_split_diagnostics: Dict[str, int] = {}
         self._last_reassignment_diagnostics: Dict[str, int] = {}
         self.group_gradient_buffer: Dict[str, List[np.ndarray]] = defaultdict(list)
         self.smooth_probabilities: Dict[str, Deque[float]] = defaultdict(
@@ -90,23 +67,7 @@ class OCAP:
         self.mix_weights: Dict[str, Dict[str, float]] = {}
         self.group_initialized_personal_adapters: Set[str] = set()
         self.personal_adapter_update_count: MutableMapping[str, int] = defaultdict(int)
-        self.shadow_update_count: MutableMapping[str, int] = defaultdict(int)
-        self._last_shadow_diagnostics: Dict[str, float | int] = (
-            self._empty_shadow_diagnostics()
-        )
         self._ensure_adapter("global")
-
-    @staticmethod
-    def _empty_shadow_diagnostics() -> Dict[str, float | int]:
-        return {
-            "new_group_inits": 0,
-            "changed_groups": 0,
-            "refreshes": 0,
-            "refresh_skipped_no_donors": 0,
-            "refresh_donors": 0,
-            "refresh_relative_l2_sum": 0.0,
-            "refresh_cosine_distance_sum": 0.0,
-        }
 
     def _ensure_adapter(self, key: str) -> None:
         adapter = self.model.ensure_adapter(key)
@@ -127,35 +88,11 @@ class OCAP:
         return key
 
     def _routed_adapter_key(self, uid: str) -> str:
-        if self.method == "global_shared":
-            return "global"
-        if self.method == "per_user_adapter":
-            return self._personal_adapter_key(uid)
         if uid in self.group_assignment:
             key = f"group::{self.group_assignment[uid]}"
             self._ensure_adapter(key)
             return key
         return self._personal_adapter_key(uid)
-
-    def _routed_adapter_keys(self, uid: str) -> List[str]:
-        if (
-            self.group_adapter_construction == "personal_adapter_mean"
-            and self.method not in {"global_shared", "per_user_adapter"}
-            and uid in self.group_assignment
-        ):
-            gid = self.group_assignment[uid]
-            keys = [self._personal_adapter_key(member) for member in sorted(self.group_set.get(gid, set()))]
-            if keys:
-                return keys
-        return [self._routed_adapter_key(uid)]
-
-    def _forward_with_adapters(
-        self, features: np.ndarray, adapter_keys: Sequence[str],
-    ) -> torch.Tensor:
-        x = self._tensor(features)
-        if len(adapter_keys) == 1:
-            return self.model(x, adapter_keys[0])
-        return self.model.forward_mean(x, adapter_keys)
 
     def _tensor(self, features: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(features, dtype=torch.float32, device=self.device).reshape(1, -1)
@@ -182,9 +119,7 @@ class OCAP:
         if uid in self.user_bias:
             return float(self.user_bias[uid])
         ref = self.cfg.refinements
-        value = 0.0
-        if ref.per_user_bias_init_mode.strip().lower() in {"group_mean", "global_group_mix"}:
-            value = ref.per_user_bias_init_group_weight * self._group_mean_user_bias(uid)
+        value = ref.per_user_bias_init_group_weight * self._group_mean_user_bias(uid)
         value = float(np.clip(value, -ref.per_user_bias_clip, ref.per_user_bias_clip))
         self.user_bias[uid] = value
         return value
@@ -192,7 +127,7 @@ class OCAP:
     def _apply_bias(
         self, logits: torch.Tensor, uid: str, *, warmup: bool = False,
     ) -> torch.Tensor:
-        if not self.cfg.refinements.per_user_bias or warmup:
+        if warmup:
             return logits
         offset = torch.zeros_like(logits)
         offset[:, 1] = self._ensure_user_bias(uid)
@@ -226,20 +161,8 @@ class OCAP:
         gid = self._nearest_group(uid)
         if gid is not None:
             group_key = f"group::{gid}"
-            if self.group_adapter_construction == "personal_adapter_mean":
-                member_keys = [
-                    self._personal_adapter_key(member)
-                    for member in sorted(self.group_set.get(gid, set()))
-                ]
-                if member_keys:
-                    experts[group_key] = base + self.model.adapter_logits_from_hidden_mean(
-                        hidden, member_keys,
-                    )
-            else:
-                self._ensure_adapter(group_key)
-                experts[group_key] = base + self.model.adapter_logits_from_hidden(
-                    hidden, group_key,
-                )
+            self._ensure_adapter(group_key)
+            experts[group_key] = base + self.model.adapter_logits_from_hidden(hidden, group_key)
         return experts
 
     def _mix_logits(self, uid: str, experts: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, Dict[str, float]]:
@@ -269,19 +192,14 @@ class OCAP:
         active = self._routed_adapter_key(uid)
         grouping = self.cfg.grouping
         can_mix = (
-            self.method not in {"global_shared", "per_user_adapter"}
-            and grouping.low_evidence_adapter_mixing_enabled
-            and triplet.index >= grouping.backbone_warmup_steps
+            triplet.index >= grouping.backbone_warmup_steps
             and self.user_record_counts[uid] < grouping.low_evidence_mixing_max_records
         )
         if can_mix:
             experts = self._expert_logits(triplet.features, uid)
             mixed, weights = self._mix_logits(uid, experts)
             return self._apply_bias(mixed, uid, warmup=False), "safe_mix", experts, weights
-        adapter_keys = self._routed_adapter_keys(uid)
-        logits = self._forward_with_adapters(triplet.features, adapter_keys)
-        if self.group_adapter_construction == "personal_adapter_mean" and uid in self.group_assignment:
-            active = f"personal_adapter_mean::{self.group_assignment[uid]}"
+        logits = self.model(self._tensor(triplet.features), active)
         return self._apply_bias(
             logits, uid, warmup=triplet.index < grouping.backbone_warmup_steps,
         ), active, {}, {}
@@ -300,7 +218,7 @@ class OCAP:
 
     def _current_threshold(self) -> float:
         train = self.cfg.training
-        if train.threshold_mode != "in_window" or len(self.threshold_history) < train.threshold_min_history:
+        if len(self.threshold_history) < train.threshold_min_history:
             return float(train.threshold_default)
         if self.threshold_updates % max(1, train.threshold_refresh_every) == 0:
             probabilities = np.asarray([row[0] for row in self.threshold_history], dtype=np.float64)
@@ -354,19 +272,16 @@ class OCAP:
         if total > 0.0:
             self.mix_weights[uid] = {key: value / total for key, value in updated.items()}
 
-    def _update_gradient_history(self, uid: str, features: np.ndarray) -> np.ndarray | None:
+    def _update_gradient_history(self, uid: str) -> np.ndarray | None:
         grad = self.model.backbone.gradient_projection.grad
         gradient_direction = None
         if grad is not None:
             gradient_direction = grad.detach().cpu().numpy().reshape(-1).astype(np.float64, copy=True)
             if np.all(np.isfinite(gradient_direction)) and np.linalg.norm(gradient_direction) > 1e-12:
-                if self.cfg.training.normalize_gradient_direction:
-                    gradient_direction = normalize(gradient_direction)
                 decay = self.cfg.training.gradient_history_decay
                 old = self.gradient_history.get(uid)
                 updated = gradient_direction if old is None else decay * old + (1.0 - decay) * gradient_direction
                 self.gradient_history[uid] = updated.copy()
-                self.gradient_history_count[uid] += 1
                 if uid not in self.interval_gradient_history:
                     self.interval_gradient_history[uid] = gradient_direction.copy()
                 else:
@@ -374,68 +289,31 @@ class OCAP:
                         decay * self.interval_gradient_history[uid]
                         + (1.0 - decay) * gradient_direction
                     )
-                # The historical implementation stores a persistent EMA, not a
-                # sample sum. The count is therefore a presence marker.
-                self.interval_gradient_count[uid] = 1
-        feature = normalize(features)
-        old_feature = self.feature_representation.get(uid)
-        decay = self.cfg.training.gradient_history_decay
-        updated_feature = feature if old_feature is None else decay * old_feature + (1.0 - decay) * feature
-        self.feature_representation[uid] = normalize(updated_feature)
         return gradient_direction
 
     def _learn_from_triplet(self, triplet: DataTriplet, raw_probability_before_update: float) -> None:
         uid = triplet.user_id
-        adapter_keys = self._routed_adapter_keys(uid)
-        shadow_key = None
-        if self.group_adapter_construction == "shadow_personal_adapter" and uid in self.group_assignment:
-            shadow_key = self._personal_adapter_key(uid)
-        for adapter_key in adapter_keys:
-            self._ensure_adapter(adapter_key)
-        if shadow_key is not None:
-            self._ensure_adapter(shadow_key)
+        adapter_key = self._routed_adapter_key(uid)
+        optimizer = self.adapter_optimizers[adapter_key]
         self.model.train()
         self.backbone_optimizer.zero_grad(set_to_none=True)
-        for adapter_key in adapter_keys:
-            self.adapter_optimizers[adapter_key].zero_grad(set_to_none=True)
-        if shadow_key is not None:
-            self.adapter_optimizers[shadow_key].zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         is_warmup = triplet.index < self.cfg.grouping.backbone_warmup_steps
-        hidden = None
-        if shadow_key is not None and len(adapter_keys) == 1:
-            hidden = self.model.hidden(self._tensor(triplet.features))
-            hard_logits = self.model.logits_from_hidden(hidden, adapter_keys[0])
-        else:
-            hard_logits = self._forward_with_adapters(triplet.features, adapter_keys)
+        hard_logits = self.model(self._tensor(triplet.features), adapter_key)
         logits = self._apply_bias(hard_logits, uid, warmup=is_warmup)
         loss = self._task_loss(logits, triplet.label)
         loss.backward()
-        gradient_direction = self._update_gradient_history(uid, triplet.features)
-        if shadow_key is not None and hidden is not None:
-            shadow_logits = self._apply_bias(
-                self.model.detached_backbone_logits_from_hidden(hidden, shadow_key),
-                uid,
-                warmup=is_warmup,
-            )
-            self._task_loss(shadow_logits, triplet.label).backward()
+        gradient_direction = self._update_gradient_history(uid)
         if is_warmup:
             self.backbone_optimizer.step()
-        for adapter_key in adapter_keys:
-            self.adapter_optimizers[adapter_key].step()
-            if adapter_key == self._personal_adapter_key(uid):
-                self.personal_adapter_update_count[uid] += 1
-        if shadow_key is not None:
-            self.adapter_optimizers[shadow_key].step()
+        optimizer.step()
+        if adapter_key == self._personal_adapter_key(uid):
             self.personal_adapter_update_count[uid] += 1
-            self.shadow_update_count[uid] += 1
         if not is_warmup and gradient_direction is not None and uid in self.group_assignment:
             self.group_gradient_buffer[self.group_assignment[uid]].append(gradient_direction)
         self.backbone_optimizer.zero_grad(set_to_none=True)
-        for adapter_key in adapter_keys:
-            self.adapter_optimizers[adapter_key].zero_grad(set_to_none=True)
-        if shadow_key is not None:
-            self.adapter_optimizers[shadow_key].zero_grad(set_to_none=True)
-        if self.cfg.refinements.per_user_bias and not is_warmup:
+        optimizer.zero_grad(set_to_none=True)
+        if not is_warmup:
             ref = self.cfg.refinements
             current = self._ensure_user_bias(uid)
             gradient = raw_probability_before_update - float(triplet.label)
@@ -469,7 +347,7 @@ class OCAP:
         minimum = grouping.warmup_initial_min_samples if initial else grouping.min_observations
         users = [
             uid for uid in sorted(self.interval_gradient_history)
-            if self.user_record_counts[uid] >= minimum and self.interval_gradient_count[uid] > 0
+            if self.user_record_counts[uid] >= minimum
         ]
         if not initial:
             return users
@@ -478,7 +356,6 @@ class OCAP:
         fallback = [
             uid for uid in sorted(self.interval_gradient_history)
             if self.user_record_counts[uid] >= grouping.warmup_initial_min_samples_fallback
-            and self.interval_gradient_count[uid] > 0
         ]
         return (
             fallback
@@ -521,166 +398,6 @@ class OCAP:
         values = coordinates.detach().cpu().numpy().astype(np.float64, copy=False)
         return {uid: values[index].copy() for index, uid in enumerate(ordered)}
 
-    def _buffer_for(self, uid: str, holdout: bool) -> Sequence[RecentDataPair]:
-        return self.previous_group_update_buffer.get(uid, []) if holdout else list(self.recent_data_buffers[uid])
-
-    def _adapter_loss(
-        self, members: Iterable[str], adapter_key: str, holdout: bool,
-    ) -> tuple[float, float, int, int]:
-        losses: List[float] = []
-        positive_predictions = 0
-        users_with_data = 0
-        self.model.eval()
-        with torch.no_grad():
-            for uid in sorted(members):
-                observations = self._buffer_for(uid, holdout)
-                if observations:
-                    users_with_data += 1
-                for data_pair in observations:
-                    logits = self.model(self._tensor(data_pair.features), adapter_key)
-                    losses.append(float(self._task_loss(logits, data_pair.label).item()))
-                    positive_predictions += int(self._positive_probability(logits) >= 0.5)
-        total = len(losses)
-        return (
-            float(np.mean(losses)) if losses else float("inf"),
-            positive_predictions / total if total else float("nan"),
-            total,
-            users_with_data,
-        )
-
-    @staticmethod
-    def _group_representation_stats(
-        members: Iterable[str], representations: Mapping[str, np.ndarray],
-    ) -> tuple[float, float]:
-        rows = [
-            np.asarray(representations[uid], dtype=np.float64).reshape(-1)
-            for uid in sorted(members) if uid in representations
-        ]
-        if not rows:
-            return float("nan"), float("nan")
-        matrix = np.stack(rows)
-        norms = np.linalg.norm(matrix, axis=1)
-        finite = np.isfinite(norms) & (norms > 1e-12)
-        if not np.any(finite):
-            return 0.0, -1.0
-        matrix = matrix[finite]
-        norms = norms[finite]
-        coherence = float(
-            np.linalg.norm(np.mean(matrix, axis=0))
-            / max(float(np.max(norms)), 1e-12)
-        )
-        normalized = matrix / norms[:, None]
-        if len(normalized) < 2:
-            min_cosine = 1.0
-        else:
-            similarities = normalized @ normalized.T
-            min_cosine = float(
-                np.min(similarities[np.triu_indices(len(normalized), k=1)])
-            )
-        return coherence, min_cosine
-
-    def _verified_splits(
-        self,
-        clusters: Sequence[Set[str]],
-        representations: Mapping[str, np.ndarray],
-        personal_adapter_sources: Mapping[str, str],
-        step: int,
-    ) -> tuple[List[Set[str]], int]:
-        ref = self.cfg.refinements
-        diagnostics = {
-            "disabled": 0,
-            "clusters": len(clusters),
-            "skipped_group_limit": 0,
-            "skipped_user_support": 0,
-            "skipped_geometry": 0,
-            "skipped_proposal": 0,
-            "skipped_child_users": 0,
-            "skipped_child_events": 0,
-            "rejected_validation": 0,
-            "accepted": 0,
-        }
-        if not ref.verified_split:
-            diagnostics["disabled"] = 1
-            self._last_split_diagnostics = diagnostics
-            return list(clusters), 0
-        output: List[Set[str]] = []
-        accepted = 0
-        current_groups = len(clusters)
-        for index, cluster in enumerate(clusters):
-            if current_groups >= ref.split_max_groups:
-                diagnostics["skipped_group_limit"] += 1
-                output.append(set(cluster))
-                continue
-            if len(cluster) < 2 * ref.split_min_users:
-                diagnostics["skipped_user_support"] += 1
-                output.append(set(cluster))
-                continue
-            parent_cohesion, parent_min_cosine = self._group_representation_stats(
-                cluster, representations,
-            )
-            if (
-                not np.isfinite(parent_cohesion)
-                or not np.isfinite(parent_min_cosine)
-                or parent_cohesion > self.cfg.grouping.cfl_coherence_threshold
-                or parent_min_cosine > self.cfg.grouping.cfl_disagreement_cosine_threshold
-            ):
-                diagnostics["skipped_geometry"] += 1
-                output.append(set(cluster))
-                continue
-            proposal = binary_split(set(cluster), representations)
-            if proposal is None:
-                diagnostics["skipped_proposal"] += 1
-                output.append(set(cluster))
-                continue
-            left, right = proposal
-            if min(len(left), len(right)) < ref.split_min_users:
-                diagnostics["skipped_child_users"] += 1
-                output.append(set(cluster))
-                continue
-            left_events = sum(len(self.previous_group_update_buffer.get(uid, [])) for uid in left)
-            right_events = sum(len(self.previous_group_update_buffer.get(uid, [])) for uid in right)
-            if min(left_events, right_events) < ref.split_min_events:
-                diagnostics["skipped_child_events"] += 1
-                output.append(set(cluster))
-                continue
-            keys = [f"diagnostic::{step}::{index}::{name}" for name in ("parent", "left", "right")]
-            self.model.set_adapter_mean(keys[0], [personal_adapter_sources[u] for u in sorted(cluster)])
-            self.model.set_adapter_mean(keys[1], [personal_adapter_sources[u] for u in sorted(left)])
-            self.model.set_adapter_mean(keys[2], [personal_adapter_sources[u] for u in sorted(right)])
-            parent_loss, parent_rate, parent_n, parent_users = self._adapter_loss(cluster, keys[0], True)
-            left_loss, left_rate, left_n, _ = self._adapter_loss(left, keys[1], True)
-            right_loss, right_rate, right_n, _ = self._adapter_loss(right, keys[2], True)
-            child_n = left_n + right_n
-            child_loss = (left_loss * left_n + right_loss * right_n) / child_n if child_n else float("inf")
-            child_rate = (left_rate * left_n + right_rate * right_n) / child_n if child_n else float("nan")
-            left_cohesion, _ = self._group_representation_stats(left, representations)
-            right_cohesion, _ = self._group_representation_stats(right, representations)
-            child_cohesion = (
-                left_cohesion * len(left) + right_cohesion * len(right)
-            ) / len(cluster)
-            delta = parent_loss - child_loss
-            rate_ok = (
-                np.isfinite(parent_rate) and np.isfinite(child_rate)
-                and child_rate <= parent_rate + ref.split_pred_posrate_delta_tol
-            )
-            cohesion_ok = (
-                np.isfinite(child_cohesion)
-                and child_cohesion >= parent_cohesion - ref.split_cohesion_tolerance
-            )
-            if (
-                parent_users >= ref.split_holdout_min_users and parent_n and child_n
-                and delta > ref.split_loss_margin and rate_ok and cohesion_ok
-            ):
-                output.extend([left, right])
-                accepted += 1
-                current_groups += 1
-            else:
-                diagnostics["rejected_validation"] += 1
-                output.append(set(cluster))
-        diagnostics["accepted"] = accepted
-        self._last_split_diagnostics = diagnostics
-        return output, accepted
-
     def _recent_loss(self, uid: str, adapter_key: str) -> float:
         observations = list(self.recent_data_buffers[uid])
         if len(observations) < self.cfg.refinements.reassignment_min_buffer:
@@ -704,7 +421,6 @@ class OCAP:
         result = [set(cluster) for cluster in clusters]
         boundary_index = self.group_update_count
         diagnostics = {
-            "disabled": int(not ref.reassignment_enabled),
             "skipped_cadence": 0,
             "skipped_group_count": 0,
             "users_for_grouping": len(users_for_grouping),
@@ -715,9 +431,6 @@ class OCAP:
             "evaluated_users": 0,
             "moves": 0,
         }
-        if not ref.reassignment_enabled:
-            self._last_reassignment_diagnostics = diagnostics
-            return result, 0
         if boundary_index % max(1, ref.reassignment_every) != 0:
             diagnostics["skipped_cadence"] = 1
             self._last_reassignment_diagnostics = diagnostics
@@ -772,91 +485,22 @@ class OCAP:
         self._last_reassignment_diagnostics = diagnostics
         return [cluster for cluster in result if cluster], moves
 
-    @staticmethod
-    def _adapter_state_distance(
-        left: Mapping[str, torch.Tensor], right: Mapping[str, torch.Tensor],
-    ) -> tuple[float, float]:
-        left_vector = torch.cat([left[name].detach().reshape(-1).float() for name in sorted(left)])
-        right_vector = torch.cat([right[name].detach().reshape(-1).float() for name in sorted(right)])
-        relative_l2 = float(
-            torch.linalg.vector_norm(right_vector - left_vector).item()
-            / max(torch.linalg.vector_norm(left_vector).item(), 1e-12)
-        )
-        denominator = float(
-            torch.linalg.vector_norm(left_vector).item()
-            * torch.linalg.vector_norm(right_vector).item()
-        )
-        cosine_distance = (
-            1.0 - float(torch.dot(left_vector, right_vector).item()) / denominator
-            if denominator > 1e-12 else 0.0
-        )
-        return relative_l2, cosine_distance
-
     def _initialize_group_adapter(
-        self,
-        gid: str,
-        members: Set[str],
-        personal_adapter_sources: Mapping[str, str],
-        created: bool,
-        membership_changed: bool = False,
-        inherit_adapter_key: str | None = None,
+        self, gid: str, members: Set[str], personal_adapter_sources: Mapping[str, str], created: bool,
     ) -> None:
         key = f"group::{gid}"
-        sources = [personal_adapter_sources[uid] for uid in sorted(members)]
-        if self.group_adapter_construction == "personal_adapter_mean":
+        if created or key not in self.model._external_to_internal:
+            sources = [personal_adapter_sources[uid] for uid in sorted(members)]
             self.model.set_adapter_mean(key, sources)
             self._reset_adapter_optimizer(key)
-            return
-        if created or key not in self.model._external_to_internal:
-            if (
-                inherit_adapter_key is not None
-                and inherit_adapter_key in self.model._external_to_internal
-            ):
-                self.model.set_adapter_state(
-                    key, self.model.clone_adapter_state(inherit_adapter_key),
-                )
-            else:
-                self.model.set_adapter_mean(key, sources)
-            self._reset_adapter_optimizer(key)
-            if self.group_adapter_construction == "shadow_personal_adapter":
-                self._last_shadow_diagnostics["new_group_inits"] += 1
         else:
             self._ensure_adapter(key)
-            grouping = self.cfg.grouping
-            should_refresh = (
-                self.group_adapter_construction == "shadow_personal_adapter"
-                and (
-                    membership_changed
-                    or not grouping.shadow_group_refresh_changed_only
-                )
-                and grouping.shadow_group_refresh_alpha > 0.0
-            )
-            if should_refresh:
-                valid_uids = [
-                    uid for uid in sorted(members)
-                    if self.personal_adapter_update_count[uid]
-                    >= grouping.shadow_group_refresh_min_updates
-                ]
-                if valid_uids:
-                    valid_sources = [personal_adapter_sources[uid] for uid in valid_uids]
-                    before = self.model.clone_adapter_state(key)
-                    self.model.blend_adapter_with_mean(
-                        key, valid_sources, grouping.shadow_group_refresh_alpha,
-                    )
-                    after = self.model.clone_adapter_state(key)
-                    relative_l2, cosine_distance = self._adapter_state_distance(before, after)
-                    self._last_shadow_diagnostics["refreshes"] += 1
-                    self._last_shadow_diagnostics["refresh_donors"] += len(valid_sources)
-                    self._last_shadow_diagnostics["refresh_relative_l2_sum"] += relative_l2
-                    self._last_shadow_diagnostics["refresh_cosine_distance_sum"] += cosine_distance
-                else:
-                    self._last_shadow_diagnostics["refresh_skipped_no_donors"] += 1
 
     def _initialize_personal_adapter_from_group(self, uid: str, gid: str) -> None:
         if uid in self.group_initialized_personal_adapters:
             return
         grouping = self.cfg.grouping
-        if not grouping.personal_adapter_group_init_enabled or self.user_record_counts[uid] < grouping.personal_adapter_group_init_min_records:
+        if self.user_record_counts[uid] < grouping.personal_adapter_group_init_min_records:
             return
         self.model.blend_adapter(
             self._personal_adapter_key(uid), f"group::{gid}", grouping.personal_adapter_group_init_weight
@@ -869,31 +513,13 @@ class OCAP:
         if not users_for_grouping:
             return
         sources = {uid: self._personal_adapter_source(uid) for uid in users_for_grouping}
-        raw_user_representations = (
-            self.feature_representation
-            if self.grouping_signal == "feature"
-            else self.interval_gradient_history
+        projected_user_representations = self._project_user_representations(
+            users_for_grouping, self.interval_gradient_history,
         )
-        users_for_grouping = [uid for uid in users_for_grouping if uid in raw_user_representations]
-        if not users_for_grouping:
-            return
-        projected_user_representations = self._project_user_representations(users_for_grouping, raw_user_representations)
         users_for_grouping = [uid for uid in users_for_grouping if uid in projected_user_representations]
         if not users_for_grouping:
             return
-        incremental_result = None
-        grouping = self.cfg.grouping
-        if self.method == "one_group_adapter":
-            clusters = [set(users_for_grouping)]
-            stop_reason = "forced_one_group"
-            merges = max(0, len(users_for_grouping) - 1)
-            last_similarity = float("nan")
-        elif self.grouping_signal == "random":
-            clusters = random_groups(users_for_grouping, self.cfg.grouping.minimum_group_count, self.cfg.seed + self.group_update_count)
-            stop_reason = "random_k"
-            merges = max(0, len(users_for_grouping) - len(clusters))
-            last_similarity = float("nan")
-        elif initial:
+        if initial:
             target = int(self.cfg.grouping.warmup_initial_target_groups)
             if target <= 0:
                 target = int(math.ceil(math.sqrt(float(len(users_for_grouping)))))
@@ -913,24 +539,6 @@ class OCAP:
             stop_reason = "warmup_forced_target"
             merges = result.merges
             last_similarity = result.last_similarity
-        elif grouping.group_update_mode == "incremental_split_merge" and self.group_set:
-            previous_clusters = [
-                set(members) & set(users_for_grouping) for members in self.group_set.values()
-            ]
-            incremental_result = incremental_split_merge_groups(
-                users_for_grouping,
-                projected_user_representations,
-                [cluster for cluster in previous_clusters if cluster],
-                grouping.minimum_group_count,
-                grouping.min_pair_cosine,
-                grouping.incremental_split_min_users,
-                grouping.incremental_objective_margin,
-                grouping.incremental_max_split_merge_swaps,
-            )
-            clusters = incremental_result.clusters
-            stop_reason = incremental_result.stop_reason
-            merges = incremental_result.merges
-            last_similarity = incremental_result.last_similarity
         else:
             result = agglomerative_groups(
                 users_for_grouping, projected_user_representations,
@@ -940,49 +548,13 @@ class OCAP:
             stop_reason = result.stop_reason
             merges = result.merges
             last_similarity = result.last_similarity
-        if incremental_result is None:
-            clusters, split_count = self._verified_splits(
-                clusters, raw_user_representations, sources, step,
-            )
-        else:
-            split_count = incremental_result.split_accepts
-            self._last_split_diagnostics = {
-                "disabled": 1,
-                "clusters": len(clusters),
-                "accepted": 0,
-            }
         clusters, reassignment_moves = self._apply_dynamic_user_reassignment(
             clusters, users_for_grouping, sources, step,
         )
         previous = {gid: set(users) for gid, users in self.group_set.items()}
         new_groups, self.next_group_index, created = match_clusters(previous, clusters, self.next_group_index)
-        inherited_adapters = 0
-        inherit_by_gid: Dict[str, str] = {}
-        if incremental_result is not None:
-            for gid in created:
-                members = new_groups[gid]
-                candidates = [
-                    (len(members & old_members), old_gid)
-                    for old_gid, old_members in previous.items()
-                    if f"group::{old_gid}" in self.model._external_to_internal
-                ]
-                if candidates:
-                    overlap, old_gid = max(candidates, key=lambda item: (item[0], item[1]))
-                    if overlap > 0:
-                        inherit_by_gid[gid] = f"group::{old_gid}"
-        self._last_shadow_diagnostics = self._empty_shadow_diagnostics()
         for gid, members in new_groups.items():
-            membership_changed = gid in previous and previous[gid] != members
-            self._last_shadow_diagnostics["changed_groups"] += int(membership_changed)
-            self._initialize_group_adapter(
-                gid,
-                members,
-                sources,
-                gid in created,
-                membership_changed,
-                inherit_by_gid.get(gid),
-            )
-            inherited_adapters += int(gid in inherit_by_gid)
+            self._initialize_group_adapter(gid, members, sources, gid in created)
         self.group_set = new_groups
         self.group_assignment = {uid: gid for gid, users in self.group_set.items() for uid in users}
         for uid, gid in self.group_assignment.items():
@@ -997,63 +569,23 @@ class OCAP:
             "users_for_grouping": len(users_for_grouping),
             "n_groups": len(self.group_set),
             "n_merges": merges,
-            "n_verified_splits": split_count,
             "n_reassignment_moves": reassignment_moves,
             "churn": churn,
             "stop_reason": stop_reason,
             "last_similarity": last_similarity,
-            "incremental_enabled": int(incremental_result is not None),
-            "incremental_split_attempts": (
-                incremental_result.split_attempts if incremental_result is not None else 0
-            ),
-            "incremental_split_accepts": (
-                incremental_result.split_accepts if incremental_result is not None else 0
-            ),
-            "incremental_objective_before": (
-                incremental_result.objective_before if incremental_result is not None else float("nan")
-            ),
-            "incremental_objective_after": (
-                incremental_result.objective_after if incremental_result is not None else float("nan")
-            ),
-            "incremental_reused_users": (
-                incremental_result.reused_users if incremental_result is not None else 0
-            ),
-            "incremental_new_users": (
-                incremental_result.new_users if incremental_result is not None else 0
-            ),
-            "incremental_similarity_evaluations": (
-                incremental_result.similarity_evaluations if incremental_result is not None else 0
-            ),
-            "incremental_inherited_adapters": inherited_adapters,
-            **{
-                f"split_{key}": value
-                for key, value in self._last_split_diagnostics.items()
-            },
             **{
                 f"reassignment_{key}": value
                 for key, value in self._last_reassignment_diagnostics.items()
-            },
-            **{
-                f"shadow_{key}": value
-                for key, value in self._last_shadow_diagnostics.items()
             },
         })
 
     def _boundary(self, step: int, initial: bool) -> None:
         gradient_groups = self._apply_group_gradient_update()
-        if self.method not in {"global_shared", "per_user_adapter"}:
-            self._update_groups(step, initial=initial)
-            if self.group_trace and self.group_trace[-1]["step"] == step:
-                self.group_trace[-1]["gradient_update_groups"] = gradient_groups
-        self.previous_group_update_buffer = {uid: list(rows) for uid, rows in self.group_update_buffer.items()}
-        self.group_update_buffer = defaultdict(list)
-        if initial and not self.cfg.grouping.warmup_gradient_history_keep_after_initial:
-            self.interval_gradient_history = {}
-            self.interval_gradient_count = defaultdict(int)
-        else:
-            self.interval_gradient_count = defaultdict(
-                int, {uid: 1 for uid in self.interval_gradient_history}
-            )
+        self._update_groups(step, initial=initial)
+        if self.group_trace and self.group_trace[-1]["step"] == step:
+            self.group_trace[-1]["gradient_update_groups"] = gradient_groups
+        if initial:
+            self.interval_gradient_history.clear()
 
     def process(self, triplet: DataTriplet) -> Dict[str, object]:
         uid = triplet.user_id
@@ -1085,7 +617,6 @@ class OCAP:
         self._learn_from_triplet(triplet, raw_probability)
         data_pair = RecentDataPair(triplet.features.copy(), triplet.label)
         self.recent_data_buffers[uid].append(data_pair)
-        self.group_update_buffer[uid].append(data_pair)
         self.threshold_history.append((probability, triplet.label))
         self.threshold_updates += 1
         self.user_record_counts[uid] += 1
@@ -1094,12 +625,8 @@ class OCAP:
         warmup = self.cfg.grouping.backbone_warmup_steps
         interval = self.cfg.grouping.group_update_interval
         if step == warmup:
-            self._boundary(step, initial=self.cfg.grouping.warmup_initial_grouping_enabled)
-        elif (
-            self.cfg.grouping.periodic_group_update_enabled
-            and step > warmup
-            and (step - warmup) % max(1, interval) == 0
-        ):
+            self._boundary(step, initial=True)
+        elif step > warmup and (step - warmup) % max(1, interval) == 0:
             self._boundary(step, initial=False)
         return row
 
@@ -1125,12 +652,8 @@ class OCAP:
             "n_data_triplets": len(self.prediction_history),
             "n_users": len(self.user_record_counts),
             "configuration": "main",
-            "group_adapter_construction": self.group_adapter_construction,
+            "group_adapter_construction": "merged_trainable",
             "personal_adapter_updates": int(sum(self.personal_adapter_update_count.values())),
-            "shadow_updates": int(sum(self.shadow_update_count.values())),
-            "shadow_group_refreshes": int(sum(
-                int(row.get("shadow_refreshes", 0)) for row in self.group_trace
-            )),
         }
 
     def run(self, stream: Sequence[DataTriplet]) -> Dict[str, object]:

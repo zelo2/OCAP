@@ -71,9 +71,7 @@ def run(
         config.seed = int(seed)
         config.device = device
         config, main_configuration = apply_main_configuration(config, configuration_name)
-        ocap = OCAP(
-            len(feature_names), config, "ocap", "gradient", "merged_trainable",
-        )
+        ocap = OCAP(len(feature_names), config)
         metrics = ocap.run(stream)
         run_dir = root / f"{dataset}_{main_configuration.name}_seed{seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
