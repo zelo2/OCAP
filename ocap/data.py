@@ -4,7 +4,7 @@ import argparse
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Sequence
+from typing import List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -106,11 +106,7 @@ def prepare_stream(
     return frame
 
 
-def load_stream(
-    path: str | Path,
-    legacy_global_scaling: bool = False,
-    no_scaling: bool = False,
-) -> tuple[List[DataTriplet], List[str]]:
+def load_stream(path: str | Path) -> tuple[List[DataTriplet], List[str]]:
     frame = _read_table(Path(path))
     missing = [name for name in REQUIRED_COLUMNS if name not in frame.columns]
     if missing:
@@ -120,18 +116,8 @@ def load_stream(
     if not feature_columns:
         raise ValueError("No feature columns were found")
     matrix = frame[feature_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
-    if legacy_global_scaling and no_scaling:
-        raise ValueError("legacy_global_scaling and no_scaling are mutually exclusive")
-    if no_scaling:
-        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    elif legacy_global_scaling:
-        means = np.nanmean(matrix, axis=0)
-        stds = np.nanstd(matrix, axis=0)
-        matrix = (np.nan_to_num(matrix, nan=means) - means) / np.maximum(stds, 1e-6)
-        matrix = np.clip(matrix, -10.0, 10.0).astype(np.float32)
-    else:
-        scaler = OnlineStandardizer(matrix.shape[1])
-        matrix = np.stack([scaler.transform_then_update(row) for row in matrix])
+    scaler = OnlineStandardizer(matrix.shape[1])
+    matrix = np.stack([scaler.transform_then_update(row) for row in matrix])
     data_triplets = [
         DataTriplet(
             index=i,
@@ -143,26 +129,6 @@ def load_stream(
         for i in range(len(frame))
     ]
     return data_triplets, feature_columns
-
-
-def synthetic_stream(seed: int = 42, n_users: int = 12, triplets_per_user: int = 24,
-                     n_features: int = 12) -> tuple[List[DataTriplet], List[str]]:
-    rng = np.random.default_rng(seed)
-    user_groups = rng.integers(0, 3, size=n_users)
-    group_weights = rng.normal(0.0, 0.8, size=(3, n_features))
-    rows = []
-    for step in range(triplets_per_user):
-        order = rng.permutation(n_users)
-        for user in order:
-            x = rng.normal(size=n_features) + 0.25 * user_groups[user]
-            logit = float(x @ group_weights[user_groups[user]] / np.sqrt(n_features))
-            logit += float(rng.normal(scale=0.4))
-            y = int(rng.random() < 1.0 / (1.0 + np.exp(-logit)))
-            rows.append(DataTriplet(
-                index=len(rows), user_id=f"u{user:03d}", timestamp=str(len(rows)),
-                label=y, features=x.astype(np.float32),
-            ))
-    return rows, [f"x{i}" for i in range(n_features)]
 
 
 def main() -> None:

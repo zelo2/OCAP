@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
@@ -19,7 +20,6 @@ if str(ROOT) not in sys.path:
 from ocap.config import load_config
 from ocap.data import load_stream
 from ocap.framework import OCAP
-from ocap.settings import apply_main_configuration
 
 
 def _sha256(path: str | Path) -> str:
@@ -50,14 +50,24 @@ def run(
     device: str,
     torch_threads: int,
 ) -> None:
-    configuration_name = "main"
+    config = load_config(dataset=dataset)
+    config.device = device
+    main_configuration = {
+        "dataset": dataset,
+        "name": "main",
+        "gradient_history_alpha": float(1 - Decimal(str(config.training.gradient_history_decay))),
+        "grouping_min_observations": config.grouping.min_observations,
+        "minimum_group_count": config.grouping.minimum_group_count,
+        "reassignment_min_observations": config.refinements.reassignment_min_observations,
+        "reassignment_loss_margin": config.refinements.reassignment_loss_margin,
+    }
     stream, feature_names = load_stream(data)
     root = Path(output)
     root.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(max(1, int(torch_threads)))
     manifest: dict[str, Any] = {
         "dataset": dataset,
-        "configuration": configuration_name,
+        "configuration": "main",
         "data": str(data),
         "data_sha256": _sha256(data),
         "n_data_triplets": len(stream),
@@ -67,13 +77,10 @@ def run(
         "group_adapter_construction": "merged_trainable",
     }
     for seed in seeds:
-        config = load_config(dataset=dataset)
         config.seed = int(seed)
-        config.device = device
-        config, main_configuration = apply_main_configuration(config, configuration_name)
         ocap = OCAP(len(feature_names), config)
         metrics = ocap.run(stream)
-        run_dir = root / f"{dataset}_{main_configuration.name}_seed{seed}"
+        run_dir = root / f"{dataset}_main_seed{seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "metrics.json").write_text(
             json.dumps(_json_safe(metrics), indent=2, sort_keys=True),
@@ -90,16 +97,16 @@ def run(
             yaml.safe_dump(config.to_dict(), sort_keys=False), encoding="utf-8",
         )
         (run_dir / "configuration.json").write_text(
-            json.dumps(main_configuration.to_dict(), indent=2, sort_keys=True), encoding="utf-8",
+            json.dumps(main_configuration, indent=2, sort_keys=True), encoding="utf-8",
         )
         overall = metrics["overall"]
         print(
-            f"{dataset}/{main_configuration.name}/seed{seed}: "
+            f"{dataset}/main/seed{seed}: "
             f"F1={overall['f1']:.4f}, recall={overall['recall']:.4f}, "
             f"specificity={overall['specificity']:.4f}",
             flush=True,
         )
-        manifest["resolved_configuration"] = main_configuration.to_dict()
+        manifest["resolved_configuration"] = main_configuration
     (root / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8",
     )

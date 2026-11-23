@@ -58,7 +58,6 @@ class TransformerBackbone(nn.Module):
         ])
         self.norm = nn.LayerNorm(dim)
         self.gradient_projection = nn.Parameter(torch.zeros(dim, dim))
-        self.gradient_projection_enabled = True
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         tokens = x.unsqueeze(-1) * self.feat_w.unsqueeze(0) + self.feat_b.unsqueeze(0)
@@ -68,8 +67,7 @@ class TransformerBackbone(nn.Module):
             h, weights = block(h)
             attention.append(weights)
         z = self.norm(h[:, 0, :])
-        if self.gradient_projection_enabled:
-            z = z + z @ self.gradient_projection.t()
+        z = z + z @ self.gradient_projection.t()
         return z, attention
 
 
@@ -97,9 +95,6 @@ class OCAPModel(nn.Module):
                 self.cfg.hidden_dim, self.cfg.lora_rank, self.cfg.lora_alpha
             ).to(torch.device(self.device_name))
         return self.adapters[self._external_to_internal[key]]
-
-    def adapter(self, key: str) -> LoRAAdapter:
-        return self.ensure_adapter(key)
 
     def hidden(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)[0]

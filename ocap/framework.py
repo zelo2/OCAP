@@ -69,18 +69,12 @@ class OCAP:
         self.personal_adapter_update_count: MutableMapping[str, int] = defaultdict(int)
         self._ensure_adapter("global")
 
-    def _ensure_adapter(self, key: str) -> None:
+    def _ensure_adapter(self, key: str, *, reset_optimizer: bool = False) -> None:
         adapter = self.model.ensure_adapter(key)
-        if key not in self.adapter_optimizers:
+        if reset_optimizer or key not in self.adapter_optimizers:
             self.adapter_optimizers[key] = torch.optim.Adam(
                 adapter.parameters(), lr=self.cfg.training.adapter_lr,
             )
-
-    def _reset_adapter_optimizer(self, key: str) -> None:
-        self._ensure_adapter(key)
-        self.adapter_optimizers[key] = torch.optim.Adam(
-            self.model.adapter(key).parameters(), lr=self.cfg.training.adapter_lr,
-        )
 
     def _personal_adapter_key(self, uid: str) -> str:
         key = f"personal::{uid}"
@@ -246,7 +240,7 @@ class OCAP:
         adjusted = base - train.user_threshold_posrate_bias_alpha * (user_rate - group_rate)
         return float(np.clip(adjusted, 0.05, 0.95))
 
-    def _predict(self, triplet: DataTriplet) -> tuple[int, float, float, str, Dict[str, torch.Tensor], Dict[str, float]]:
+    def _predict(self, triplet: DataTriplet) -> tuple[float, float, str, Dict[str, torch.Tensor], Dict[str, float]]:
         self.model.eval()
         with torch.no_grad():
             logits, adapter_source, experts, weights = self._prediction_logits(triplet)
@@ -254,8 +248,7 @@ class OCAP:
         history = self.smooth_probabilities[triplet.user_id]
         history.append(raw_probability)
         probability = float(np.mean(history))
-        threshold = self._biased_threshold(triplet.user_id, self._current_threshold())
-        return int(probability >= threshold), probability, raw_probability, adapter_source, experts, weights
+        return probability, raw_probability, adapter_source, experts, weights
 
     def _update_mix_weights(
         self, uid: str, experts: Mapping[str, torch.Tensor], weights: Mapping[str, float], label: int,
@@ -349,9 +342,7 @@ class OCAP:
             uid for uid in sorted(self.interval_gradient_history)
             if self.user_record_counts[uid] >= minimum
         ]
-        if not initial:
-            return users
-        if len(users) >= grouping.warmup_min_grouping_users:
+        if not initial or len(users) >= grouping.warmup_min_grouping_users:
             return users
         fallback = [
             uid for uid in sorted(self.interval_gradient_history)
@@ -362,11 +353,6 @@ class OCAP:
             if len(fallback) >= grouping.warmup_initial_min_grouping_users_fallback
             else []
         )
-
-    def _personal_adapter_source(self, uid: str) -> str:
-        # New groups are initialized from each member's personal adapter,
-        # even when that user is currently routed through an existing group.
-        return self._personal_adapter_key(uid)
 
     @staticmethod
     def _project_user_representations(
@@ -399,9 +385,7 @@ class OCAP:
         return {uid: values[index].copy() for index, uid in enumerate(ordered)}
 
     def _recent_loss(self, uid: str, adapter_key: str) -> float:
-        observations = list(self.recent_data_buffers[uid])
-        if len(observations) < self.cfg.refinements.reassignment_min_buffer:
-            return float("inf")
+        observations = self.recent_data_buffers[uid]
         losses = []
         self.model.eval()
         with torch.no_grad():
@@ -419,7 +403,6 @@ class OCAP:
     ) -> tuple[List[Set[str]], int]:
         ref = self.cfg.refinements
         result = [set(cluster) for cluster in clusters]
-        boundary_index = self.group_update_count
         diagnostics = {
             "skipped_cadence": 0,
             "skipped_group_count": 0,
@@ -431,7 +414,7 @@ class OCAP:
             "evaluated_users": 0,
             "moves": 0,
         }
-        if boundary_index % max(1, ref.reassignment_every) != 0:
+        if self.group_update_count % max(1, ref.reassignment_every) != 0:
             diagnostics["skipped_cadence"] = 1
             self._last_reassignment_diagnostics = diagnostics
             return result, 0
@@ -447,7 +430,6 @@ class OCAP:
         cluster_by_user = {
             uid: index for index, cluster in enumerate(result) for uid in cluster
         }
-        sizes = {index: len(cluster) for index, cluster in enumerate(result)}
         moves = 0
         for uid in sorted(users_for_grouping):
             if self.user_record_counts[uid] < ref.reassignment_min_observations:
@@ -460,7 +442,7 @@ class OCAP:
                 diagnostics["skipped_unassigned"] += 1
                 continue
             current = cluster_by_user[uid]
-            if sizes[current] <= 1:
+            if len(result[current]) <= 1:
                 diagnostics["skipped_singleton"] += 1
                 continue
             diagnostics["evaluated_users"] += 1
@@ -477,8 +459,6 @@ class OCAP:
             ):
                 result[current].discard(uid)
                 result[best].add(uid)
-                sizes[current] -= 1
-                sizes[best] += 1
                 cluster_by_user[uid] = best
                 moves += 1
         diagnostics["moves"] = moves
@@ -492,7 +472,7 @@ class OCAP:
         if created or key not in self.model._external_to_internal:
             sources = [personal_adapter_sources[uid] for uid in sorted(members)]
             self.model.set_adapter_mean(key, sources)
-            self._reset_adapter_optimizer(key)
+            self._ensure_adapter(key, reset_optimizer=True)
         else:
             self._ensure_adapter(key)
 
@@ -502,56 +482,37 @@ class OCAP:
         grouping = self.cfg.grouping
         if self.user_record_counts[uid] < grouping.personal_adapter_group_init_min_records:
             return
+        personal_key = self._personal_adapter_key(uid)
         self.model.blend_adapter(
-            self._personal_adapter_key(uid), f"group::{gid}", grouping.personal_adapter_group_init_weight
+            personal_key, f"group::{gid}", grouping.personal_adapter_group_init_weight
         )
-        self._reset_adapter_optimizer(self._personal_adapter_key(uid))
+        self._ensure_adapter(personal_key, reset_optimizer=True)
         self.group_initialized_personal_adapters.add(uid)
 
     def _update_groups(self, step: int, initial: bool = False) -> None:
         users_for_grouping = self._users_ready_for_grouping(initial)
         if not users_for_grouping:
             return
-        sources = {uid: self._personal_adapter_source(uid) for uid in users_for_grouping}
+        sources = {uid: self._personal_adapter_key(uid) for uid in users_for_grouping}
         projected_user_representations = self._project_user_representations(
             users_for_grouping, self.interval_gradient_history,
         )
-        users_for_grouping = [uid for uid in users_for_grouping if uid in projected_user_representations]
-        if not users_for_grouping:
-            return
+        grouping = self.cfg.grouping
+        target = grouping.minimum_group_count
+        min_cosine = grouping.min_pair_cosine
         if initial:
-            target = int(self.cfg.grouping.warmup_initial_target_groups)
+            target = grouping.warmup_initial_target_groups
             if target <= 0:
-                target = int(math.ceil(math.sqrt(float(len(users_for_grouping)))))
-            target = max(
-                self.cfg.grouping.warmup_initial_min_groups,
-                min(len(users_for_grouping), self.cfg.grouping.warmup_initial_max_groups, target),
-            )
-            initial_floor = (
-                -1.0
-                if self.cfg.grouping.warmup_initial_force_accept
-                else self.cfg.grouping.min_pair_cosine
-            )
-            result = agglomerative_groups(
-                users_for_grouping, projected_user_representations, target, initial_floor,
-            )
-            clusters = result.clusters
-            stop_reason = "warmup_forced_target"
-            merges = result.merges
-            last_similarity = result.last_similarity
-        else:
-            result = agglomerative_groups(
-                users_for_grouping, projected_user_representations,
-                self.cfg.grouping.minimum_group_count, self.cfg.grouping.min_pair_cosine,
-            )
-            clusters = result.clusters
-            stop_reason = result.stop_reason
-            merges = result.merges
-            last_similarity = result.last_similarity
+                target = math.ceil(math.sqrt(len(users_for_grouping)))
+            target = max(grouping.warmup_initial_min_groups, min(grouping.warmup_initial_max_groups, target))
+            if grouping.warmup_initial_force_accept:
+                min_cosine = -1.0
+        result = agglomerative_groups(users_for_grouping, projected_user_representations, target, min_cosine)
         clusters, reassignment_moves = self._apply_dynamic_user_reassignment(
-            clusters, users_for_grouping, sources, step,
+            result.clusters, users_for_grouping, sources, step,
         )
-        previous = {gid: set(users) for gid, users in self.group_set.items()}
+        previous = self.group_set
+        old_assignment = self.group_assignment
         new_groups, self.next_group_index, created = match_clusters(previous, clusters, self.next_group_index)
         for gid, members in new_groups.items():
             self._initialize_group_adapter(gid, members, sources, gid in created)
@@ -560,7 +521,6 @@ class OCAP:
         for uid, gid in self.group_assignment.items():
             self._initialize_personal_adapter_from_group(uid, gid)
         self.group_update_count += 1
-        old_assignment = {uid: gid for gid, users in previous.items() for uid in users}
         common = set(old_assignment) & set(self.group_assignment)
         churn = float(np.mean([old_assignment[u] != self.group_assignment[u] for u in common])) if common else 0.0
         self.group_trace.append({
@@ -568,11 +528,11 @@ class OCAP:
             "initial": initial,
             "users_for_grouping": len(users_for_grouping),
             "n_groups": len(self.group_set),
-            "n_merges": merges,
+            "n_merges": result.merges,
             "n_reassignment_moves": reassignment_moves,
             "churn": churn,
-            "stop_reason": stop_reason,
-            "last_similarity": last_similarity,
+            "stop_reason": "warmup_forced_target" if initial else result.stop_reason,
+            "last_similarity": result.last_similarity,
             **{
                 f"reassignment_{key}": value
                 for key, value in self._last_reassignment_diagnostics.items()
@@ -590,7 +550,8 @@ class OCAP:
     def process(self, triplet: DataTriplet) -> Dict[str, object]:
         uid = triplet.user_id
         self._personal_adapter_key(uid)
-        prediction, probability, raw_probability, adapter_source, experts, weights = self._predict(triplet)
+        probability, raw_probability, adapter_source, experts, weights = self._predict(triplet)
+        threshold = self._biased_threshold(uid, self._current_threshold())
         is_warmup = triplet.index < self.cfg.grouping.backbone_warmup_steps
         row: Dict[str, object] = {
             "time_index": triplet.index,
@@ -598,10 +559,10 @@ class OCAP:
             "user_id": uid,
             "user_record_index": self.user_record_counts[uid] + 1,
             "label": triplet.label,
-            "prediction": prediction,
+            "prediction": int(probability >= threshold),
             "probability": probability,
             "raw_probability": raw_probability,
-            "threshold": self._biased_threshold(uid, self._current_threshold()),
+            "threshold": threshold,
             "routed_adapter": adapter_source,
             "group_id": self.group_assignment.get(uid, ""),
             "learning_phase": "backbone_warmup" if is_warmup else "adapter_learning",

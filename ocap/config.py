@@ -84,7 +84,7 @@ class EvaluationConfig:
 
 @dataclass
 class ExperimentConfig:
-    dataset: str = "synthetic"
+    dataset: str = "custom"
     seed: int = 42
     device: str = "cpu"
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -99,7 +99,7 @@ class ExperimentConfig:
 
 def _construct(data: Dict[str, Any]) -> ExperimentConfig:
     return ExperimentConfig(
-        dataset=str(data.get("dataset", "synthetic")),
+        dataset=str(data.get("dataset", "custom")),
         seed=int(data.get("seed", 42)),
         device=str(data.get("device", "cpu")),
         model=ModelConfig(**data.get("model", {})),
@@ -110,21 +110,10 @@ def _construct(data: Dict[str, Any]) -> ExperimentConfig:
     )
 
 
-def load_config(path: str | Path | None = None, dataset: str = "synthetic") -> ExperimentConfig:
+def load_config(path: str | Path | None = None, dataset: str | None = None) -> ExperimentConfig:
     if path is None:
-        if dataset == "synthetic":
-            cfg = ExperimentConfig(dataset="synthetic")
-            cfg.model.hidden_dim = 16
-            cfg.model.depth = 1
-            cfg.model.num_heads = 2
-            cfg.model.ff_mult = 2
-            cfg.grouping.backbone_warmup_steps = 20
-            cfg.grouping.min_observations = 4
-            cfg.grouping.group_update_interval = 20
-            cfg.grouping.warmup_min_grouping_users = 4
-            cfg.grouping.warmup_initial_max_groups = 4
-            cfg.evaluation.first_k = [5, 10]
-            return cfg
+        if dataset not in {"ces", "globem"}:
+            raise ValueError("Specify dataset='ces' or dataset='globem', or supply a configuration file.")
         root = Path(__file__).resolve().parents[1]
         path = root / "configs" / f"{dataset}.yaml"
     with Path(path).open("r", encoding="utf-8") as handle:

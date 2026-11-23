@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Iterable, List
 
@@ -92,22 +93,12 @@ def build_globem_weekly_arff(
     selected_df[selected_cols] = (selected_df[selected_cols] - means) / stds
     selected_df[selected_cols] = selected_df[selected_cols].fillna(0.0)
 
-    arff_feature_names = []
     rename_map = {}
     for idx, col in enumerate(selected_cols):
-        safe_name = (
-            str(col)
-            .replace(":", "_")
-            .replace("/", "_")
-            .replace("-", "_")
-            .replace(".", "_")
-            .replace("(", "_")
-            .replace(")", "_")
-            .replace(" ", "_")
-        )
+        safe_name = re.sub(r"[:/(). -]", "_", str(col))
         safe_name = f"g_{idx:04d}_{safe_name}"
         rename_map[col] = safe_name
-        arff_feature_names.append(safe_name)
+    arff_feature_names = list(rename_map.values())
     selected_df = selected_df.rename(columns=rename_map)
 
     _write_arff(

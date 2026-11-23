@@ -130,8 +130,7 @@ python process/run_ocap.py \
   --torch-threads 1
 ```
 
-All model and optimization hyperparameters are fixed by
-`configs/ces.yaml`, `configs/globem.yaml`, and `ocap/settings.py`. The
+The main experiments use the hyperparameters in `configs/ces.yaml` and `configs/globem.yaml`. The
 commands above require no manual hyperparameter selection.
 
 ## Data policy

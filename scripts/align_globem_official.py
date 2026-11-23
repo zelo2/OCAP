@@ -23,6 +23,19 @@ DEFAULT_MODALITIES = [
 ]
 
 
+RECORD_COLUMNS = [
+    "cohort",
+    "uid",
+    "pid",
+    "date",
+    "label_dep_weekly",
+    "target_bdi2_weekly",
+    "platform",
+    "is_ios",
+    "is_android",
+]
+
+
 SEMANTIC_BUCKET_BY_MODALITY = {
     "bluetooth": "social_communication",
     "call": "social_communication",
@@ -98,8 +111,9 @@ def _load_feature_table(
 ) -> Tuple[pd.DataFrame, Dict[str, object], pd.DataFrame]:
     path = cohort_dir / "FeatureData" / f"{modality}.csv"
     df = pd.read_csv(path, low_memory=False)
-    raw_rows = int(len(df))
+    raw_rows = len(df)
     df = _drop_index_columns(df)
+    initial_feature_columns = len(df.columns) - 2
     df = _normalize_pid_date(df)
     df = df.merge(weekly_keys, on=["pid", "date"], how="inner")
 
@@ -131,7 +145,7 @@ def _load_feature_table(
     summary = {
         "source_rows": raw_rows,
         "matched_weekly_rows": int(len(df)),
-        "initial_feature_columns": int(len([c for c in pd.read_csv(path, nrows=1).columns if not c.startswith("Unnamed:")])) - 2,
+        "initial_feature_columns": initial_feature_columns,
         "dropped_discrete_rank_columns": int(len(dropped_discrete)),
         "dropped_mixed_type_columns": int(len(dropped_mixed)),
         "dropped_high_missing_columns": int(len(dropped_high_missing)),
@@ -173,18 +187,7 @@ def _prepare_one_cohort(
     base["uid"] = base["cohort"] + "::" + base["pid"]
     base = base.sort_values(["uid", "date"]).reset_index(drop=True)
 
-    ordered_front = [
-        "cohort",
-        "uid",
-        "pid",
-        "date",
-        "label_dep_weekly",
-        "target_bdi2_weekly",
-        "platform",
-        "is_ios",
-        "is_android",
-    ]
-    ordered_front = [c for c in ordered_front if c in base.columns]
+    ordered_front = [c for c in RECORD_COLUMNS if c in base.columns]
     other_cols = [c for c in base.columns if c not in ordered_front]
     base = base[ordered_front + other_cols]
 
@@ -196,26 +199,7 @@ def _prepare_one_cohort(
         "participants_in_output": int(base["uid"].nunique()),
         "positive_rate": float(base["label_dep_weekly"].mean()) if len(base) else 0.0,
         "feature_tables": feature_summaries,
-        "final_feature_columns": int(
-            len(
-                [
-                    c
-                    for c in base.columns
-                    if c
-                    not in {
-                        "cohort",
-                        "uid",
-                        "pid",
-                        "date",
-                        "label_dep_weekly",
-                        "target_bdi2_weekly",
-                        "platform",
-                        "is_ios",
-                        "is_android",
-                    }
-                ]
-            )
-        ),
+        "final_feature_columns": sum(c not in RECORD_COLUMNS for c in base.columns),
     }
     manifest_df = pd.concat(manifests, ignore_index=True) if manifests else pd.DataFrame()
     return base, summary, manifest_df
@@ -269,26 +253,7 @@ def build_dataset(
         "participants": int(combined["uid"].nunique()),
         "cohorts": sorted(combined["cohort"].unique().tolist()),
         "positive_rate": float(combined["label_dep_weekly"].mean()) if len(combined) else 0.0,
-        "feature_columns": int(
-            len(
-                [
-                    c
-                    for c in combined.columns
-                    if c
-                    not in {
-                        "cohort",
-                        "uid",
-                        "pid",
-                        "date",
-                        "label_dep_weekly",
-                        "target_bdi2_weekly",
-                        "platform",
-                        "is_ios",
-                        "is_android",
-                    }
-                ]
-            )
-        ),
+        "feature_columns": sum(c not in RECORD_COLUMNS for c in combined.columns),
     }
     (out_dir / "globem_weekly_preprocessing_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),
