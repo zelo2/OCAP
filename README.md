@@ -4,6 +4,8 @@ Official implementation of **OCAP: Online Collaborative Adapter Personalization 
 
 This repository includes the OCAP framework, dataset preparation scripts, and commands for running the main experiments on CES and GLOBEM.
 
+Both datasets link individual participants’ sensing records to mental-health assessments. To protect participant privacy, we provide scripts to prepare the data locally and direct readers to the original releases for access. Please follow the [dataset preparation instructions](#dataset-preparation) below.
+
 ## Repository structure
 
 ```text
@@ -30,7 +32,7 @@ python -m pip install -e .
 
 ### CES
 
-Download the **College Experience Dataset (CES)** from its
+Please download the **College Experience Dataset (CES)** from its
 [official Kaggle page](https://www.kaggle.com/datasets/subigyanepal/college-experience-dataset).
 After extracting the archive, place the release files so that the following
 two paths exist:
@@ -58,11 +60,7 @@ used in the experiments, and orders the resulting data by collection time.
 
 ### GLOBEM
 
-Download **GLOBEM v1.1** from its
-[official PhysioNet page](https://physionet.org/content/globem/1.1/).
-GLOBEM is credentialed health data. To access the dataset, sign in to PhysioNet,
-complete its required training, and accept the dataset data-use agreement.
-Do not redistribute the downloaded or processed participant-level data.
+PhysioNet limits access to **GLOBEM v1.1** to credentialed users. Please sign in to PhysioNet, complete its credentialing and training requirements, and sign the data use agreement before downloading the files from the [official dataset page](https://physionet.org/content/globem/1.1/).
 
 Place the four extracted cohort directories as follows:
 
@@ -142,5 +140,5 @@ commands above require no manual hyperparameter selection.
 
 The `.gitignore` rules prevent raw data, processed participant records,
 predictions, and checkpoints from being committed. Before publishing a fork,
-verify that `git status` contains no files under `data/raw/`,
+please verify that `git status` contains no files under `data/raw/`,
 `data/processed/`, or `results/`.
