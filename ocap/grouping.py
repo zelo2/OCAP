@@ -5,6 +5,8 @@ from typing import Dict, List, Mapping, Sequence, Set, Tuple
 
 import numpy as np
 
+from .config import GroupingConfig
+
 
 def normalize(vector: np.ndarray) -> np.ndarray:
     value = np.asarray(vector, dtype=np.float64).reshape(-1)
@@ -20,6 +22,46 @@ def cosine(left: np.ndarray, right: np.ndarray) -> float:
     if not np.any(a) or not np.any(b):
         return -1.0
     return float(np.clip(np.dot(a, b), -1.0, 1.0))
+
+
+def eligible_users(
+    histories: Mapping[str, np.ndarray], counts: Mapping[str, int], grouping: GroupingConfig,
+    *, initial: bool,
+) -> List[str]:
+    minimum = grouping.warmup_initial_min_samples if initial else grouping.min_observations
+    users = [
+        uid for uid in sorted(histories)
+        if counts[uid] >= minimum
+    ]
+    if not initial or len(users) >= grouping.warmup_min_grouping_users:
+        return users
+    fallback = [
+        uid for uid in sorted(histories)
+        if counts[uid] >= grouping.warmup_initial_min_samples_fallback
+    ]
+    return (
+        fallback
+        if len(fallback) >= grouping.warmup_initial_min_grouping_users_fallback
+        else []
+    )
+
+
+def nearest_group(
+    uid: str, assignments: Mapping[str, str], groups: Mapping[str, Set[str]],
+    histories: Mapping[str, np.ndarray],
+) -> str | None:
+    if uid in assignments:
+        return assignments[uid]
+    if uid not in histories:
+        return None
+    prototypes = {}
+    for gid, members in groups.items():
+        rows = [histories[user] for user in members if user in histories]
+        if rows:
+            prototypes[gid] = normalize(np.mean(np.stack(rows), axis=0))
+    if not prototypes:
+        return None
+    return max(prototypes, key=lambda gid: cosine(histories[uid], prototypes[gid]))
 
 
 def agglomerative_groups(

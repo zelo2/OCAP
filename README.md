@@ -14,7 +14,10 @@ data/raw/                Please download CES and GLOBEM and place the raw files 
 data/processed/          The preparation scripts save the processed data here.
 process/run_ocap.py       Main OCAP experiment runner
 scripts/                 CES and GLOBEM preparation utilities
-ocap/                    OCAP implementation
+ocap/framework.py        Online loop (OCAP.process), adapter training, and user reassignment
+ocap/gradients.py        Gradient histories, PCA, and shared backbone updates
+ocap/grouping.py         User eligibility, clustering, and group matching
+ocap/prediction.py       Expert weights and prediction thresholds
 ```
 
 ## Installation
