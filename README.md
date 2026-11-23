@@ -1,13 +1,8 @@
 # OCAP
 
-This anonymous repository contains the implementation of OCAP. It includes
-the OCAP framework, dataset preparation scripts, and the runner for the main
-experiments.
+Official implementation of **OCAP: Online Collaborative Adapter Personalization for Mental-Health Monitoring**, which was accepted at **KDD 2027**.
 
-Participant-level data are not included. Reviewers must download CES and
-GLOBEM from their official sources and prepare them locally as described
-below. The repository intentionally excludes baseline implementations, paper
-sources, reported-result files, and author-identifying infrastructure.
+This repository includes the OCAP framework, dataset preparation scripts, and commands for running the main experiments on CES and GLOBEM.
 
 ## Repository structure
 
@@ -18,7 +13,6 @@ data/processed/          Prepared streams (not tracked by Git)
 process/run_ocap.py       Main OCAP experiment runner
 scripts/                 CES and GLOBEM preparation utilities
 ocap/                    OCAP implementation
-tests/                   Tests for the OCAP implementation
 ```
 
 ## Installation
@@ -66,7 +60,7 @@ used in the experiments, and orders the resulting data by collection time.
 
 Download **GLOBEM v1.1** from its
 [official PhysioNet page](https://physionet.org/content/globem/1.1/).
-GLOBEM is credentialed health data. Reviewers must sign in to PhysioNet,
+GLOBEM is credentialed health data. To access the dataset, sign in to PhysioNet,
 complete its required training, and accept the dataset data-use agreement.
 Do not redistribute the downloaded or processed participant-level data.
 
@@ -143,15 +137,6 @@ python process/run_ocap.py \
 All model and optimization hyperparameters are fixed by
 `configs/ces.yaml`, `configs/globem.yaml`, and `ocap/settings.py`. The
 commands above require no manual hyperparameter selection.
-
-## Tests
-
-The tests use synthetic or temporary inputs and do not require either private
-dataset:
-
-```bash
-python -m unittest discover -s tests -v
-```
 
 ## Data policy
 

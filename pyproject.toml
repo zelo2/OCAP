@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ocap-kdd-artifact"
 version = "0.1.0"
-description = "Anonymous implementation of OCAP for personalized mental-health monitoring"
+description = "Official implementation of OCAP: Online Collaborative Adapter Personalization for Mental-Health Monitoring"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
@@ -20,6 +20,3 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ocap*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
