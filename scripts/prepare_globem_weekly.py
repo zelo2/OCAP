@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -32,11 +32,10 @@ def _safe_nominal(value: object) -> str:
 def _write_arff(
     out_path: Path,
     relation: str,
-    uid_values: Iterable[str],
     feature_names: List[str],
     rows: pd.DataFrame,
 ) -> None:
-    uid_nominal = ",".join(_safe_nominal(v) for v in sorted(set(uid_values)))
+    uid_nominal = ",".join(_safe_nominal(v) for v in sorted(set(rows["uid"])))
     with out_path.open("w", encoding="utf-8") as f:
         f.write(f"@relation {relation}\n\n")
         f.write(f"@attribute uid {{{uid_nominal}}}\n")
@@ -75,11 +74,10 @@ def build_globem_weekly_arff(
 
     numeric_cols = [c for c in df.columns if c not in META_COLUMNS]
     aux_cols = [c for c in ["is_ios", "is_android"] if c in numeric_cols] if keep_aux_features else []
-    behavior_cols = [c for c in numeric_cols if c not in set(aux_cols)]
+    behavior_cols = [c for c in numeric_cols if c not in aux_cols]
 
     medians = df[behavior_cols].median(numeric_only=True)
-    behavior_matrix = df[behavior_cols].copy()
-    behavior_matrix = behavior_matrix.fillna(medians)
+    behavior_matrix = df[behavior_cols].fillna(medians)
     variances = behavior_matrix.var(axis=0, ddof=0).sort_values(ascending=False)
     selected_behavior = variances.head(max(1, int(top_k_features))).index.tolist()
     selected_cols = aux_cols + selected_behavior
@@ -104,9 +102,8 @@ def build_globem_weekly_arff(
     _write_arff(
         out_path=output_path,
         relation=relation,
-        uid_values=df["uid"].tolist(),
         feature_names=arff_feature_names,
-        rows=selected_df[["uid", "label_dep_weekly"] + arff_feature_names],
+        rows=selected_df,
     )
 
     manifest_rows = []

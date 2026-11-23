@@ -18,7 +18,6 @@ REQUIRED_COLUMNS = ("user_id", "timestamp", "label")
 class DataTriplet:
     index: int
     user_id: str
-    timestamp: str
     label: int
     features: np.ndarray
 
@@ -122,7 +121,6 @@ def load_stream(path: str | Path) -> tuple[List[DataTriplet], List[str]]:
         DataTriplet(
             index=i,
             user_id=str(frame.at[i, "user_id"]),
-            timestamp=str(frame.at[i, "timestamp"]),
             label=int(frame.at[i, "label"]),
             features=matrix[i],
         )

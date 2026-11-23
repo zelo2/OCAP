@@ -21,11 +21,12 @@ class TransformerBlock(nn.Module):
             nn.Linear(dim, dim * ff_mult), nn.GELU(), nn.Linear(dim * ff_mult, dim)
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        attended, weights = self.attn(x, x, x, need_weights=True)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Preserve the attention kernel used for the paper results.
+        attended, _ = self.attn(x, x, x, need_weights=True)
         x = self.norm1(x + self.dropout(attended))
         x = self.norm2(x + self.dropout(self.ff(x)))
-        return x, weights
+        return x
 
 
 class LoRAAdapter(nn.Module):
@@ -59,16 +60,14 @@ class TransformerBackbone(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.gradient_projection = nn.Parameter(torch.zeros(dim, dim))
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = x.unsqueeze(-1) * self.feat_w.unsqueeze(0) + self.feat_b.unsqueeze(0)
         h = torch.cat([self.cls.expand(x.shape[0], -1, -1), tokens], dim=1) + self.pos
-        attention = []
         for block in self.blocks:
-            h, weights = block(h)
-            attention.append(weights)
+            h = block(h)
         z = self.norm(h[:, 0, :])
         z = z + z @ self.gradient_projection.t()
-        return z, attention
+        return z
 
 
 class OCAPModel(nn.Module):
@@ -96,8 +95,11 @@ class OCAPModel(nn.Module):
             ).to(torch.device(self.device_name))
         return self.adapters[self._external_to_internal[key]]
 
+    def remove_adapter(self, key: str) -> None:
+        del self.adapters[self._external_to_internal.pop(key)]
+
     def hidden(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)[0]
+        return self.backbone(x)
 
     def base_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.head(hidden)

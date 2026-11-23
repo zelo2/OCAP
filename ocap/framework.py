@@ -61,10 +61,10 @@ class OCAP:
             maxlen=max(1, self.cfg.training.threshold_window)
         )
         self.cached_threshold = float(self.cfg.training.threshold_default)
-        self.threshold_updates = 0
         self.mix_weights: Dict[str, Dict[str, float]] = {}
         self.group_initialized_personal_adapters: Set[str] = set()
-        self._ensure_adapter("global")
+        # Keep adapter initialization in the same random sequence as the paper runs.
+        self.model.ensure_adapter("global")
 
     def _ensure_adapter(self, key: str, *, reset_optimizer: bool = False) -> None:
         adapter = self.model.ensure_adapter(key)
@@ -207,7 +207,7 @@ class OCAP:
         train = self.cfg.training
         if len(self.threshold_history) < train.threshold_min_history:
             return float(train.threshold_default)
-        if self.threshold_updates % max(1, train.threshold_refresh_every) == 0:
+        if len(self.prediction_history) % max(1, train.threshold_refresh_every) == 0:
             probabilities = np.asarray([row[0] for row in self.threshold_history], dtype=np.float64)
             labels = np.asarray([row[1] for row in self.threshold_history], dtype=np.int64)
             best_score = -1.0
@@ -427,6 +427,8 @@ class OCAP:
                 result[current].discard(uid)
                 result[best].add(uid)
                 cluster_by_user[uid] = best
+        for key in candidate_group_adapter_keys.values():
+            self.model.remove_adapter(key)
         return [cluster for cluster in result if cluster]
 
     def _initialize_group_adapter(
@@ -503,7 +505,6 @@ class OCAP:
         data_pair = RecentDataPair(triplet.features.copy(), triplet.label)
         self.recent_data_buffers[uid].append(data_pair)
         self.threshold_history.append((probability, triplet.label))
-        self.threshold_updates += 1
         self.user_record_counts[uid] += 1
         self.positive_record_counts[uid] += int(triplet.label == 1)
         step = triplet.index + 1
