@@ -10,8 +10,8 @@ Both datasets link individual participants’ sensing records to mental-health a
 
 ```text
 configs/                 Dataset-specific OCAP configurations
-data/raw/                Official downloads (not tracked by Git)
-data/processed/          Prepared streams (not tracked by Git)
+data/raw/                Please download CES and GLOBEM and place the raw files here.
+data/processed/          The preparation scripts save the processed data here.
 process/run_ocap.py       Main OCAP experiment runner
 scripts/                 CES and GLOBEM preparation utilities
 ocap/                    OCAP implementation
@@ -103,8 +103,6 @@ The final files used by the experiment runners are:
 data/processed/ces_historical_usernorm.csv
 data/processed/globem_full.csv
 ```
-
-Both `data/raw/` and `data/processed/` are ignored by Git.
 
 ## Running OCAP
 
