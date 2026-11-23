@@ -132,8 +132,8 @@ class OCAP:
 
     def _expert_logits(self, features: np.ndarray, uid: str) -> Dict[str, torch.Tensor]:
         x = self._tensor(features)
-        hidden = self.model.hidden(x)
-        base = self.model.base_logits_from_hidden(hidden)
+        hidden = self.model.backbone(x)
+        base = self.model.head(hidden)
         experts: Dict[str, torch.Tensor] = {"global": base}
         personal_key = self._personal_adapter_key(uid)
         experts["personal"] = base + self.model.adapter_logits_from_hidden(hidden, personal_key)

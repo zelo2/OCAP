@@ -81,6 +81,10 @@ class OCAPModel(nn.Module):
         self.device_name = device
         self.to(torch.device(device))
 
+    def forward(self, x: torch.Tensor, adapter_key: str) -> torch.Tensor:
+        hidden = self.backbone(x)
+        return self.head(hidden) + self.adapter_logits_from_hidden(hidden, adapter_key)
+
     @staticmethod
     def _internal_key(external_key: str) -> str:
         digest = hashlib.sha1(external_key.encode("utf-8")).hexdigest()[:20]
@@ -98,21 +102,9 @@ class OCAPModel(nn.Module):
     def remove_adapter(self, key: str) -> None:
         del self.adapters[self._external_to_internal.pop(key)]
 
-    def hidden(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
-
-    def base_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.head(hidden)
-
     def adapter_logits_from_hidden(self, hidden: torch.Tensor, adapter_key: str) -> torch.Tensor:
         delta = self.ensure_adapter(adapter_key)(hidden)
         return F.linear(delta, self.head.weight, bias=None)
-
-    def logits_from_hidden(self, hidden: torch.Tensor, adapter_key: str) -> torch.Tensor:
-        return self.base_logits_from_hidden(hidden) + self.adapter_logits_from_hidden(hidden, adapter_key)
-
-    def forward(self, x: torch.Tensor, adapter_key: str) -> torch.Tensor:
-        return self.logits_from_hidden(self.hidden(x), adapter_key)
 
     def clone_adapter_state(self, key: str) -> Dict[str, torch.Tensor]:
         return {name: value.detach().clone() for name, value in self.ensure_adapter(key).state_dict().items()}
